@@ -1,0 +1,44 @@
+{
+  "skill_name": "trtllm-main-failures-analysis",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "What's breaking on trtllm main right now? Give me a rundown with root causes.",
+      "expected_output": "A saved markdown report on recent (7d) Main Break detections from the trtllm-infra stability report, with real entity names/platforms/links and grounded root-cause hypotheses, plus a chat summary.",
+      "files": [],
+      "assertions": [
+        "Output cites at least 3 real, specific test/stage entity names (not generic placeholders) that plausibly come from the trtllm-infra Detection Details data",
+        "Output states or implies a time window (e.g. last 7 days) consistent with the dashboard's Main Break detection window",
+        "Output distinguishes confidence/severity levels or otherwise ranks failures by importance rather than listing them all as equally urgent",
+        "Output offers a root-cause hypothesis (regression / flaky / infra) per notable failure, not just a bare list of failing tests",
+        "Output includes at least one working reference link (Jenkins, test history, or NVDF document URL) back to the source data",
+        "A markdown report file was saved to disk, not just printed in chat"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Pull the last 7 days of main break detections from the stability report and summarize the worst ones.",
+      "expected_output": "Same as above, focused on top offenders by confidence/failure count.",
+      "files": [],
+      "assertions": [
+        "Output explicitly reflects a 7-day window",
+        "Output ranks/orders failures by severity (e.g. confidence, failure count, PR count) rather than an arbitrary or alphabetical list",
+        "Output cites real, specific entity names and platforms from the data, not placeholders",
+        "Output quantifies failures with real numbers (failure count, pass count, or PR count) pulled from the data",
+        "A markdown report file was saved to disk"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Is DGX_B200 having more CI trouble than other platforms on trtllm main this week?",
+      "expected_output": "An analysis grounded in real per-platform failure counts from the fetched data, answering the comparative question.",
+      "files": [],
+      "assertions": [
+        "Output gives a direct yes/no/inconclusive answer to the comparative question",
+        "Output backs the answer with real per-platform counts (e.g. number of Main Break groups or failures on DGX_B200 vs. other platforms), not a vague impression",
+        "Output names at least one specific platform other than DGX_B200 for comparison",
+        "Output does not fabricate platform names or numbers not derivable from the fetched data"
+      ]
+    }
+  ]
+}
