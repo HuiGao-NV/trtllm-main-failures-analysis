@@ -258,7 +258,7 @@ nothing outward-facing happens here.
 |---|---|---|---|
 | `infra` | Infra failure | component, recovery (`fetch_latest_status.py` / later builds), INFRA-RETRY "no infra pattern matched" strings | `notify-infra`, `add-infra-retry-pattern <strings>`, `no-code-action` (never a waive) |
 | `regression-fixed` | Regression with fix on main | fix commit/time, pre-fix base count | `rebase-affected-prs <PRs>`; post-fix-base failures → `split-off` back to Step 4 |
-| `regression-open` | Regression, no fix | culprit, mechanism, blast radius | `notify-author` (sent only via Step 8), `propose-revert-or-fix`, `file-or-link-nvbug`, `propose-temporary-waive <waives.txt line>` for wide breaks |
+| `regression-open` | Regression, no fix | culprit, mechanism, `blast_radius_groups` | per the blast-radius rule below: > 3 groups → `find-culprit-and-revert <commit>`; 1–2 groups → `propose-waive <waives.txt line>` + `file-or-link-nvbug`; plus `notify-author` (sent only via Step 8) |
 | `pr-own-defect` | culprit is the failing PR itself | mechanism | `comment-on-pr`, `exclude-from-case-log` |
 | `flaky` | Flaky test | counts, pattern, waive state | `link-nvbug`/`file-nvbug`, `propose-waive`, `request-owner-triage` |
 | `unresolved` | Unattributed | bounded range, ranked candidates, intermittency | `hardware-bisect <range>`, `sanitizer-run <shard>`, `request-owner-triage`, `track-daily` |
@@ -266,9 +266,32 @@ nothing outward-facing happens here.
 An entity matching two handlers (e.g. fixed pre-fix failures + unattributed
 post-fix ones) gets both action sets, each scoped to its build list.
 
+**Blast-radius rule (every non-`infra` handler).** Count the test groups
+(`(entity_name, platform)` pairs) that share the same failure — same
+signature/mechanism, same culprit or same bounded range — across the whole
+window, and record it as `blast_radius_groups`:
+- **> 3 groups** → the failure is wide; the primary action is
+  `find-culprit-and-revert <commit>`: pin the introducing commit (Method
+  B/C, or `ci-failure-onset-bisector` if the onset isn't known yet) and
+  propose reverting it. A waive is only a stop-gap here (`propose-temporary-waive`
+  stays secondary) — with more than 3 groups broken, waiving hides the break
+  instead of fixing it. If the culprit can't be pinned, the action is
+  `bisect-then-revert <range>` — still not a waive.
+- **1–2 groups** → the primary action is `propose-waive <waives.txt line>` +
+  `file-nvbug` (or `link-nvbug` if one already exists) so the case is tracked
+  while the owner fixes it; `notify-author` if the culprit is known.
+- **Exactly 3 groups** → judgment call; default to the waive+nvbug path
+  unless the groups are on different platforms (a cross-platform break is
+  treated as wide).
+Groups already fixed on `main` (`regression-fixed`) still get counted so the
+report states the true blast radius, but their action stays
+`rebase-affected-prs`.
+
 ```json
 {"entity_name": "...", "platform": "...", "category": "...", "handler": "...",
- "actions": [{"action": "rebase-affected-prs", "prs": ["18614"], "note": "..."}],
+ "blast_radius_groups": 5,
+ "actions": [{"action": "find-culprit-and-revert", "commit": "8fff903d8a58", "pr": "18990", "note": "..."},
+             {"action": "rebase-affected-prs", "prs": ["18614"], "note": "..."}],
  "owner": null, "status": "open | recovered | fixed-awaiting-rebase | waived | pr-own",
  "evidence_files": ["<run_dir>/analysis_<slug>.json"]}
 ```
@@ -293,7 +316,7 @@ Generated: <date>. Source: trtllm-infra stability report, Detection Details (Mai
 - Confidence / window / failure mode / mechanism (evidence files) / verify step / links
 
 ## Actions (from Step 5)
-| Entity | Platform | Failure type | Handler | Actions | Owner | Status |
+| Entity | Platform | Failure type | Handler | Blast radius (groups) | Actions | Owner | Status |
 
 ## PR-own defects (excluded from the case log)
 ## Waived / Already Tracked
