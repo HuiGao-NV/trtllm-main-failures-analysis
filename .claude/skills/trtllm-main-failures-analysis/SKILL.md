@@ -329,45 +329,64 @@ issues) and the report path.
 
 ## Step 7: Publish cases (only if asked)
 
-Targets: **Confluence** (`CONFLUENCE_PAGE_URL`; flat = one row per entity,
-nested = one row per PR-per-build) and/or **Google Sheet** (`SPREADSHEET_URL`;
-flat only). If no target is named, ask (don't default to Confluence); reuse a
-preference already given in the conversation. Publish one entry per raw
-`entity_name` — never merge related entities.
+Targets: **Confluence** (`CONFLUENCE_PAGE_URL`) and/or **Google Sheet**
+(`SPREADSHEET_URL`; flat only). If no target is named, ask (don't default to
+Confluence); reuse a preference already given in the conversation. Publish one
+entry per raw `entity_name` — never merge related entities.
 
-1. Known builds per target (Step 0 output, or fetch now).
+**Confluence layout = nested (default).** One case → its PR list → each PR's
+build list. Case-level cells (rowspan): `Case name`, `Waived (latest main)`
+(waive state in the current `waives.txt`, from `fetch_failures.py`),
+`Latest Status`. PR-level: `PR number`. Per build: `Build`, `Triggered (UTC)`
+(ci_report `ts_created`; dashboard `ts`+7 h as fallback), `Base commit`
+(merge-base of the tested head, from `get_base_commit.py`), `Error / callstack`
+(first `fetch_full_error.py` block when one exists, else the ci_report short
+message), `Waived at run`, `Bug`, `Analyzed`, `Failure analysis`, `Failure type`.
+Publishing **merges build by build**: new case/PR/build rows are added, known
+builds get their refreshable cells updated, rows only on the page are kept,
+`Analyzed` is sticky (reset only on a detected pass→fail regression or an
+explicit per-build value). The legacy flat layout (`--cases-json`) remains for
+the Sheet and for a page that still carries the flat table.
+
+1. Known builds per target (Step 0 output, or fetch now) — the nested reader
+   takes them from the `Build` column.
 2. `fetch_execution_details.py` on the **full** `fetch_failures.py` output with
-   every `--known-builds-json` → incremental executions. Safe for flat mode
-   (absent fields leave existing cells untouched). **Nested mode replaces the
-   whole table** and refuses a known-builds-filtered input — re-run without the
-   filter for nested. Nested + Sheet in one run → two `fetch_execution_details.py`
-   runs.
+   every `--known-builds-json` → incremental executions (already-published
+   builds are skipped; the nested merge keeps their rows). Each execution now
+   carries `job_ts_created` and `head_commit` from ci_report.
 3. `fetch_latest_status.py --groups-json <failures.json> --out <run_dir>/latest-status-<date>.json`
-   (last 3 runs in 24 h all PASSED = recovered; drives Latest Status and resets
-   the manual **Analyzed** flag to `"False"` only on `regressed_since_pass`;
-   never write `"True"` yourself).
-4. Build cases (`--mode nested` only for Confluence, only if the user wants
-   per-execution rows — it is thousands of rows):
+   (last 3 runs in 24 h all PASSED = recovered; drives Latest Status and marks
+   `reset_analyzed` only on `regressed_since_pass`; never write `"True"` yourself).
+4. `get_base_commit.py --executions-json <exec.json> --fix-commit <any sha> --out <run_dir>/base_commits_<date>.json`
+   for every build in the exec JSON (skip only if the run has no new builds).
+5. Build the nested cases:
    ```bash
    build_confluence_cases.py --groups-json <failures.json> --executions-json <exec.json> \
      --status-json <status.json> --failure-types-json <run_dir>/failure_types.json \
-     --mode flat --out <run_dir>/cases_<date>.json
+     --base-commits-json <run_dir>/base_commits_<date>.json --full-errors-dir <run_dir> \
+     --mode nested --date <date> --out <run_dir>/cases_nested_<date>.json
    ```
-   `failure_types.json` = `{"results": [{"entity_name", "platform", "failure_type"}]}`
-   for entities analyzed this run only. Attach Step 5's primary action to each
-   case's analysis text.
-5. Publish, then write the watermark (Step 0.5 step 4):
+   `failure_types.json` = `{"results": [{"entity_name", "platform", "failure_type",
+   "analysis", "build" (optional), "analyzed" (optional)}]}` for entities analyzed
+   this run: an entry without `build` applies to every build of the entity; an
+   entry with `build` overrides that build only (use it when builds of one case
+   have different causes, e.g. stale-base vs. new failure). `analysis` = the
+   Step 4 conclusion from error message/callstack + commit history, ending
+   with Step 5's primary action. Flat mode is unchanged
+   (`--mode flat --out cases_<date>.json`).
+6. Publish, then write the watermark (Step 0.5 step 4):
    ```bash
-   post_confluence_cases.py --cases-json <cases.json>      # flat   | --nested-json for nested
+   post_confluence_cases.py --nested-json <cases_nested.json>   # merge; --replace only to convert a flat page
    sync_confluence_watermark.py --write <ts>
-   post_google_sheet_cases.py --cases-json <cases.json>    # flat only
+   post_google_sheet_cases.py --cases-json <cases_flat.json>    # flat only
    sync_sheet_watermark.py --write <ts>
    ```
-   Confluence flat: matches rows by (case, PR), **appends** date + analysis,
-   **overwrites** status cells only when the field is present; migrates missing
-   columns in place; nested rebuilds the table but carries Analyzed forward and
-   dates each build row from its execution. Sheet: same merge semantics on a
-   grid, one write. Credentials: Confluence `~/.config/confluence/credentials.json`
+   Confluence nested refuses to merge into a page whose table is not in the
+   nested layout; converting the page (`--replace`) discards the old table and
+   needs explicit confirmation. Flat: matches rows by (case, PR), **appends**
+   date + analysis, **overwrites** status cells only when the field is present;
+   migrates missing columns in place. Sheet: same merge semantics on a grid,
+   one write. Credentials: Confluence `~/.config/confluence/credentials.json`
    (`{"email", "api_token"}`); Sheets — Apps Script webhook
    `~/.config/gsheets/apps_script.json` (`scripts/apps_script/Code.gs`; no GCP
    permissions needed — use when IAM blocks the others), or
@@ -376,8 +395,8 @@ preference already given in the conversation. Publish one entry per raw
    A plain `gcloud auth` token lacks Sheets scope. If credentials are missing
    or `PERMISSION_DENIED` appears, tell the user the setup steps — don't retry
    variations.
-6. **Confirm before the first publish to a target in the conversation, before
-   any schema migration, and before any nested replace**; use `--dry-run` to
+7. **Confirm before the first publish to a target in the conversation, before
+   any schema migration, and before any `--replace` (flat→nested conversion)**; use `--dry-run` to
    show the exact row changes. Each target is confirmed independently.
 
 ## Step 8: Slack notification (only if asked)

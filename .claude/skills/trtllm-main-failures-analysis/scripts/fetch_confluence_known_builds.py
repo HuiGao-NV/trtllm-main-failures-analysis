@@ -48,13 +48,13 @@ def extract_known_builds(storage_html: str) -> set[str]:
     headers = [h.strip().lower() for h in get_header_labels(header_row)]
     known: set[str] = set()
 
-    if "build id" not in headers and "build-pr mapping" not in headers:
+    if "build id" not in headers and "build" not in headers and "build-pr mapping" not in headers:
         return known
 
     grid = reconstruct_grid(header_row, data_rows)
 
-    if "build id" in headers:
-        idx = headers.index("build id")
+    if "build id" in headers or "build" in headers:
+        idx = headers.index("build id") if "build id" in headers else headers.index("build")
         for row in grid:
             text = row[idx].strip()
             if text and text.lower() not in ("n/a", "?", "none"):

@@ -295,6 +295,14 @@ def main():
                 "short_error_msg": (record or {}).get("s_short_error_msg") or None,
                 "log_link": find_stage_log_link(job_data, stage) if job_data else None,
                 "found_in_job_data": record is not None,
+                # Build-level facts from ci_report's job_info, used by the
+                # nested Confluence layout (build_confluence_cases.py
+                # --mode nested): the build's creation time is an unambiguous
+                # UTC epoch (the dashboard `ts` above is US-Pacific-as-epoch),
+                # and the tested head commit is what get_base_commit.py
+                # resolves the main merge-base from.
+                "job_ts_created": ((job_data or {}).get("job_info") or {}).get("ts_created"),
+                "head_commit": ((job_data or {}).get("job_info") or {}).get("s_trigger_mr_commit") or None,
             })
         # Explicit build_id -> source PR mapping, deduped across executions
         # (the ci_report link for a given execution is keyed by build_id;

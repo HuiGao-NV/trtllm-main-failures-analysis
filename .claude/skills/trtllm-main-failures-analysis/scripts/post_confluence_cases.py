@@ -332,40 +332,118 @@ def sync_cases(storage_html: str, cases: list[dict]) -> tuple[str, int, int, boo
     return before + new_table_inner + after, added, updated, migrated
 
 
-NESTED_HEADERS = ["Case name", "Latest Status", "Analyzed", "Failure Type", "PR number", "Build ID", "Date", "Failure Message", "Waived", "Bug"]
+# Nested layout: one case -> its PRs -> each PR's builds. Case-level cells
+# (name, waive state in the latest main, latest status) are rowspan-merged
+# over all of the case's rows; the PR cell over that PR's build rows; every
+# other column is per build.
+NESTED_CASE_HEADERS = ["Case name", "Waived (latest main)", "Latest Status"]
+NESTED_PR_HEADERS = ["PR number"]
+NESTED_BUILD_HEADERS = ["Build", "Triggered (UTC)", "Base commit", "Error / callstack", "Waived at run", "Bug",
+                        "Analyzed", "Failure analysis", "Failure type"]
+NESTED_HEADERS = NESTED_CASE_HEADERS + NESTED_PR_HEADERS + NESTED_BUILD_HEADERS
+# build-row field -> header
+NESTED_BUILD_FIELDS = {"build": "Build", "triggered": "Triggered (UTC)", "base_commit": "Base commit",
+                       "error": "Error / callstack", "waived": "Waived at run", "bug": "Bug",
+                       "analyzed": "Analyzed", "failure_analysis": "Failure analysis", "failure_type": "Failure type"}
+# per-build fields that are refreshed from the new data whenever present;
+# "analyzed" is sticky (human-edited) and only changes on an explicit reset.
+NESTED_BUILD_REFRESH = {"triggered", "base_commit", "error", "waived", "bug", "failure_analysis", "failure_type"}
+
+
+def _nested_headers_match(header_row_html: str | None) -> bool:
+    if header_row_html is None:
+        return False
+    labels = [h.strip().lower() for h in get_header_labels(header_row_html)]
+    return labels == [h.lower() for h in NESTED_HEADERS]
+
+
+def parse_nested_table(header_row_html: str, data_rows: list[str]) -> dict:
+    """Read an existing nested table back into
+    {case_name: {"waived_latest", "latest_status", "prs": {pr: {build: {field: value}}}}}
+    using the rowspan-expanded grid."""
+    labels = [h.strip().lower() for h in get_header_labels(header_row_html)]
+    idx = {h.lower(): i for i, h in enumerate(labels)}
+    grid = reconstruct_grid(header_row_html, data_rows)
+    existing: dict = {}
+    for row in grid:
+        name = row[idx["case name"]].strip()
+        if not name:
+            continue
+        case = existing.setdefault(name, {"waived_latest": row[idx["waived (latest main)"]].strip(),
+                                          "latest_status": row[idx["latest status"]].strip(), "prs": {}})
+        pr = row[idx["pr number"]].strip() or "n/a"
+        build = row[idx["build"]].strip() or "n/a"
+        rec = {f: row[idx[h.lower()]] for f, h in NESTED_BUILD_FIELDS.items() if h.lower() in idx}
+        rec["build"] = build
+        case["prs"].setdefault(pr, {})[build] = rec
+    return existing
+
+
+def merge_nested(existing: dict, cases: list[dict]) -> tuple[list[dict], int, int]:
+    """Merge new nested cases into the parsed existing table. Returns
+    (merged cases in publish shape, builds added, builds updated).
+    - unknown case / PR / build -> added
+    - known build -> refresh NESTED_BUILD_REFRESH fields that the new data
+      provides (non-empty); keep Analyzed unless the case carries
+      reset_analyzed or the build provides an explicit `analyzed`
+    - cases / builds only on the page are kept untouched."""
+    added = updated = 0
+    for case in cases:
+        name = case["case_name"]
+        cur = existing.setdefault(name, {"waived_latest": "?", "latest_status": "?", "prs": {}})
+        if case.get("waived_latest"):
+            cur["waived_latest"] = case["waived_latest"]
+        if case.get("latest_status"):
+            cur["latest_status"] = case["latest_status"]
+        reset = bool(case.get("reset_analyzed"))
+        if reset:
+            for pr in cur["prs"].values():
+                for rec in pr.values():
+                    rec["analyzed"] = ANALYZED_DEFAULT
+        for pr in case.get("prs") or []:
+            pr_id = str(pr.get("pr", "n/a"))
+            cur_pr = cur["prs"].setdefault(pr_id, {})
+            for b in pr.get("builds") or [{}]:
+                build = str(b.get("build", "n/a"))
+                if build in cur_pr:
+                    rec = cur_pr[build]
+                    changed = False
+                    for f in NESTED_BUILD_REFRESH:
+                        v = b.get(f)
+                        if v not in (None, "") and str(v) != rec.get(f, ""):
+                            rec[f] = str(v)
+                            changed = True
+                    if b.get("analyzed") not in (None, "") and str(b["analyzed"]) != rec.get("analyzed", ""):
+                        rec["analyzed"] = str(b["analyzed"])
+                        changed = True
+                    updated += 1 if changed else 0
+                else:
+                    rec = {f: str(b.get(f, "n/a" if f != "analyzed" else ANALYZED_DEFAULT)) for f in NESTED_BUILD_FIELDS}
+                    if b.get("analyzed") in (None, ""):
+                        rec["analyzed"] = ANALYZED_DEFAULT
+                    for f in ("failure_analysis", "failure_type"):
+                        if b.get(f) in (None, ""):
+                            rec[f] = "?"
+                    cur_pr[build] = rec
+                    added += 1
+    merged = []
+    for name in sorted(existing):
+        c = existing[name]
+        prs = []
+        for pr_id in sorted(c["prs"], key=lambda p: (0, int(p)) if p.isdigit() else (1, p)):
+            builds = [c["prs"][pr_id][b] for b in sorted(c["prs"][pr_id], key=lambda x: int(x) if x.isdigit() else 0)]
+            prs.append({"pr": pr_id, "builds": builds})
+        merged.append({"case_name": name, "waived_latest": c["waived_latest"], "latest_status": c["latest_status"], "prs": prs})
+    return merged, added, updated
 
 
 def build_nested_table(cases: list[dict]) -> str:
-    """Build a fully-nested replacement table: one row per (case, PR, build),
-    with Case name/Latest Status/Analyzed/Failure Type merged (rowspan) across
-    all of a case's rows, and PR number merged across a PR's build rows - so
-    it reads as PR-per-row with each of its build ids broken into their own
-    sub-row, each carrying its own Date/failure message. Date is deliberately NOT
-    part of the case-level merge: each build row gets its own date, from
-    that specific execution's own run time (see
-    build_confluence_cases.py's execution_date()), not a single "when this
-    report was built" stamp shared across a whole case. This is a
-    full-table rebuild, not a row-level sync/append like
-    build_row/append_to_row - there's no meaningful way to "append to" a
-    rowspan-merged cell, so re-running this always replaces the whole table
-    from the input cases. Callers should already have resolved
-    `case["analyzed"]` to its final value before calling this (see the
-    nested publish path in main(), which carries forward an existing
-    page's Analyzed values first) - this function itself has no notion of
-    "existing" vs "new".
-
-    Input case shape:
-      {"case_name": str, "latest_status": str (optional),
-       "analyzed": str (optional, defaults to ANALYZED_DEFAULT),
-       "failure_type": str (optional, defaults to "?"),
-       "prs": [{"pr": str, "builds": [
-           {"build": str, "date": str, "failure_message": str, "waived": str, "bug": str},
-           ...
-       ]}, ...]}
-    A PR with no builds (e.g. a stage-kind entity with no test-history) gets
-    a single row with build/date/failure_message/waived/bug left as given
-    (should be "N/A"/fallback placeholders from the caller).
-    """
+    """Render the nested layout (see NESTED_HEADERS). Input case shape:
+      {"case_name": str, "waived_latest": str, "latest_status": str,
+       "prs": [{"pr": str, "builds": [{"build", "triggered", "base_commit", "error",
+                "waived", "bug", "analyzed", "failure_analysis", "failure_type"}, ...]}, ...]}
+    Missing build fields render as "n/a" (Analyzed -> ANALYZED_DEFAULT,
+    Failure analysis / type -> "?")."""
     header = build_header_row(NESTED_HEADERS)
     row_htmls = []
     for case in cases:
@@ -381,19 +459,18 @@ def build_nested_table(cases: list[dict]) -> str:
                 if first_case_row:
                     rs = f' rowspan="{total_rows}"' if total_rows > 1 else ""
                     cells.append(f'<td{rs}><p>{escape(str(case["case_name"]))}</p></td>')
+                    cells.append(f'<td{rs}><p>{escape(str(case.get("waived_latest", "?")))}</p></td>')
                     cells.append(f'<td{rs}><p>{escape(str(case.get("latest_status", "?")))}</p></td>')
-                    cells.append(f'<td{rs}><p>{escape(str(case.get("analyzed", ANALYZED_DEFAULT)))}</p></td>')
-                    cells.append(f'<td{rs}><p>{escape(str(case.get("failure_type", "?")))}</p></td>')
                     first_case_row = False
                 if first_pr_row:
                     rs = f' rowspan="{pr_rows}"' if pr_rows > 1 else ""
                     cells.append(f'<td{rs}><p>{escape(str(pr.get("pr", "n/a")))}</p></td>')
                     first_pr_row = False
-                cells.append(f'<td><p>{escape(str(b.get("build", "n/a")))}</p></td>')
-                cells.append(f'<td><p>{escape(str(b.get("date", "n/a")))}</p></td>')
-                cells.append(f'<td><p>{escape(str(b.get("failure_message", "n/a")))}</p></td>')
-                cells.append(f'<td><p>{escape(str(b.get("waived", "n/a")))}</p></td>')
-                cells.append(f'<td><p>{escape(str(b.get("bug", "n/a")))}</p></td>')
+                for f in NESTED_BUILD_FIELDS:
+                    default = ANALYZED_DEFAULT if f == "analyzed" else ("?" if f in ("failure_analysis", "failure_type") else "n/a")
+                    val = b.get(f)
+                    val = default if val in (None, "") else val
+                    cells.append(f'<td><p>{escape(str(val))}</p></td>')
                 row_htmls.append("<tr>" + "".join(cells) + "</tr>")
     return "<table><tbody>" + header + "".join(row_htmls) + "</tbody></table>"
 
@@ -424,56 +501,40 @@ def main():
         nested_cases = json.loads(Path(args.nested_json).read_text())
         before, header_row, data_rows, after = parse_table_rows(storage_html)
 
-        # Nested mode always fully replaces the table, but "Analyzed" is a
-        # sticky, often human-edited flag (unlike the other columns, which
-        # are meant to be refreshed every run) - so before rebuilding, read
-        # back whatever's already on the page and carry it forward for any
-        # case that isn't explicitly forcing a reset (build_confluence_cases.py
-        # only sets `analyzed` in a case dict to force it back to "False" on
-        # a detected pass->fail regression; otherwise it leaves the field
-        # out, which here means "keep whatever's already there").
-        # "Failure Type" gets the same carry-forward treatment for a
-        # different reason: it's not human-edited, but the Step 4 analysis
-        # that fills it (in particular Method B/C's subagent checks) is only
-        # run for the entities worth digging into that run, not the full
-        # detected set - without carrying it forward, a nested republish
-        # would blank out every previously-recorded conclusion for a case
-        # that simply wasn't re-analyzed this run.
-        existing_analyzed: dict[str, str] = {}
-        existing_failure_type: dict[str, str] = {}
-        if header_row is not None:
-            headers_lower = [h.strip().lower() for h in get_header_labels(header_row)]
-            if "case name" in headers_lower:
-                name_idx = headers_lower.index("case name")
-                grid = reconstruct_grid(header_row, data_rows)
-                analyzed_idx = headers_lower.index("analyzed") if "analyzed" in headers_lower else None
-                failure_type_idx = headers_lower.index("failure type") if "failure type" in headers_lower else None
-                for row in grid:
-                    name = row[name_idx].strip()
-                    if not name:
-                        continue
-                    if analyzed_idx is not None and name not in existing_analyzed:
-                        existing_analyzed[name] = row[analyzed_idx].strip()
-                    if failure_type_idx is not None and name not in existing_failure_type:
-                        existing_failure_type[name] = row[failure_type_idx].strip()
-        for case in nested_cases:
-            if "analyzed" not in case:
-                case["analyzed"] = existing_analyzed.get(case["case_name"], ANALYZED_DEFAULT)
-            if "failure_type" not in case:
-                case["failure_type"] = existing_failure_type.get(case["case_name"], "?")
+        # Nested mode MERGES build by build into the page's existing nested
+        # table: unknown case/PR/build rows are added, known builds get their
+        # refreshable cells updated, and everything only on the page is
+        # kept. "Analyzed" is sticky (human-edited) - it is carried forward
+        # unless the case carries reset_analyzed (pass->fail regression
+        # detected by build_confluence_cases.py) or a build provides an
+        # explicit value. A page whose table is not in the nested layout
+        # (e.g. the legacy flat table) cannot be merged into; that needs
+        # --replace, which discards the old table.
+        if header_row is not None and _nested_headers_match(header_row) and not args.replace:
+            existing = parse_nested_table(header_row, data_rows)
+            merged, added, updated = merge_nested(existing, nested_cases)
+            verb = f"merge into the nested table: +{added} build row(s) added, {updated} updated; {len(merged)} case(s) total"
+        elif header_row is not None and not _nested_headers_match(header_row) and not args.replace:
+            sys.exit(
+                "The page's table is not in the nested layout (headers differ from NESTED_HEADERS); "
+                "merging is not possible. Re-run with --replace to rebuild the table in the nested layout "
+                "(the existing table is discarded - confirm with the user first), or use --cases-json for the flat layout."
+            )
+        else:
+            merged, added, updated = merge_nested({}, nested_cases)
+            verb = f"replace the table with a nested breakdown: {len(merged)} case(s), {added} build row(s)"
 
-        new_table = build_nested_table(nested_cases)
+        new_table = build_nested_table(merged)
         if header_row is None:
             new_html = storage_html + new_table if storage_html.strip() else new_table
         else:
             new_html = before + new_table.replace("<table><tbody>", "").replace("</tbody></table>", "") + after
-        row_count = sum(1 for c in nested_cases for pr in (c.get("prs") or [{}]) for _ in (pr.get("builds") or [{}]))
         if args.dry_run:
-            print(f"Would replace the table with a nested breakdown: {len(nested_cases)} case(s), {row_count} row(s), {len(new_html):,} bytes of HTML.")
+            print(f"Would {verb} ({len(new_html):,} bytes of HTML).")
             print(new_html)
             return
         update_page(args.base_url, args.page_id, auth, title, current_version + 1, new_html)
-        print(f"Published to {args.base_url}/pages/{args.page_id}: replaced table with a nested breakdown ({len(nested_cases)} case(s), {row_count} row(s)).")
+        print(f"Published to {args.base_url}/pages/{args.page_id}: {verb}.")
         return
 
     cases = json.loads(Path(args.cases_json).read_text())

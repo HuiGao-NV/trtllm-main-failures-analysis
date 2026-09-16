@@ -206,7 +206,93 @@ def execution_date(e: dict, fallback: str) -> str:
     return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date().isoformat()
 
 
-def build_nested_cases(groups: list, exec_by_key: dict, status_by_key: dict, failure_type_by_key: dict, date: str) -> list:
+DASHBOARD_TS_OFFSET_H = 7  # dashboard `ts` is US-Pacific rendered as an epoch; +7 h = UTC
+
+
+def triggered_utc(e: dict) -> str:
+    """'YYYY-MM-DD HH:MM UTC' for one execution: prefer ci_report's
+    job_info.ts_created (a true UTC epoch, recorded by fetch_execution_details.py
+    as job_ts_created), else the dashboard `ts` shifted to UTC."""
+    ts = e.get("job_ts_created")
+    if ts:
+        return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ts = e.get("ts")
+    if ts:
+        return datetime.fromtimestamp(ts / 1000 + DASHBOARD_TS_OFFSET_H * 3600, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return "n/a"
+
+
+def load_base_commits(path: str | None) -> dict:
+    """get_base_commit.py output {pr: [{build: {head_commit, base_commit, ...}}]}
+    -> {build: {"base_commit": sha12, "head_commit": sha12, "base_is_pre_fix": bool|None}}."""
+    if not path:
+        return {}
+    payload = json.loads(Path(path).read_text())
+    out = {}
+    for pr, items in payload.items():
+        for item in items:
+            for build, info in item.items():
+                out[str(build)] = {
+                    "base_commit": (info.get("base_commit") or "")[:12] or None,
+                    "head_commit": (info.get("head_commit") or "")[:12] or None,
+                    "base_is_pre_fix": info.get("base_is_pre_fix"),
+                }
+    return out
+
+
+def load_full_errors(dir_path: str | None) -> dict:
+    """Index fetch_full_error.py outputs (full_error_*.json / hist_*.json) in a
+    directory by (job, build, stage, entity_name) -> first failure block text."""
+    if not dir_path:
+        return {}
+    out = {}
+    for p in sorted(Path(dir_path).glob("*.json")):
+        try:
+            d = json.loads(p.read_text())
+        except Exception:
+            continue
+        if not isinstance(d, dict) or "blocks" not in d:
+            continue
+        blocks = d.get("blocks") or []
+        if not blocks:
+            continue
+        b = blocks[0]
+        text = b.get("text") or b.get("body") or ""
+        title = b.get("title") or ""
+        out[(d.get("job"), str(d.get("build")), d.get("stage"), d.get("entity_name"))] = (title + "\n" + text).strip()
+    return out
+
+
+def analysis_lookup(failure_type_by_key: dict, build_analysis: dict, key: tuple, build: str) -> dict:
+    """Per-build analysis wins over the entity-level entry. Returns a dict that
+    may contain failure_type / failure_analysis / analyzed (absent = leave the
+    published cell alone)."""
+    out = {}
+    ent = failure_type_by_key.get(key) or {}
+    if ent.get("failure_type"):
+        out["failure_type"] = ent["failure_type"]
+    if ent.get("analysis"):
+        out["failure_analysis"] = ent["analysis"]
+    per = build_analysis.get((key[0], key[1], str(build))) or {}
+    for src, dst in (("failure_type", "failure_type"), ("analysis", "failure_analysis"), ("analyzed", "analyzed")):
+        if per.get(src) not in (None, ""):
+            out[dst] = per[src]
+    return out
+
+
+def build_nested_cases(groups: list, exec_by_key: dict, status_by_key: dict, failure_type_by_key: dict, date: str,
+                       base_by_build: dict | None = None, full_errors: dict | None = None,
+                       build_analysis: dict | None = None) -> list:
+    """One case -> its PRs -> each PR's builds. Per build: build number,
+    job, triggered time (UTC), main base commit, error message / callstack,
+    waived-at-run, bug, and (when analysed) failure analysis + failure type +
+    analyzed flag. Case level carries the waive state in the latest main
+    (`waived_latest`, from fetch_failures.py's waive-info) and the latest
+    status. post_confluence_cases.py --nested-json merges this into the
+    page's existing nested table build by build."""
+    base_by_build = base_by_build or {}
+    full_errors = full_errors or {}
+    build_analysis = build_analysis or {}
     name_counts = Counter(g["entity_name"] for g in groups)
     nested_cases = []
     for g in groups:
@@ -226,35 +312,44 @@ def build_nested_cases(groups: list, exec_by_key: dict, status_by_key: dict, fai
                 builds = []
                 for build in sorted(by_pr[pr].keys(), key=lambda x: int(x) if x.isdigit() else 0):
                     e = by_pr[pr][build]
-                    builds.append({
+                    err = e.get("short_error_msg") or "N/A (no error message recorded)"
+                    full = full_errors.get((e.get("job"), str(build), e.get("stage"), g["entity_name"]))
+                    if full:
+                        err = full[:2000]
+                    base = base_by_build.get(str(build)) or {}
+                    row = {
                         "build": build,
+                        "job": (e.get("job") or "").split("/")[-1] or "n/a",
+                        "stage": e.get("stage") or "n/a",
                         "date": execution_date(e, date),
-                        "failure_message": e.get("short_error_msg") or "N/A (no error message recorded)",
+                        "triggered": triggered_utc(e),
+                        "base_commit": base.get("base_commit") or "n/a",
+                        "error": err,
                         "waived": waived_cell(e.get("is_waived")),
                         "bug": e.get("waive_bug_url") or "none",
-                    })
+                    }
+                    row.update(analysis_lookup(failure_type_by_key, build_analysis, key, build))
+                    builds.append(row)
                 prs.append({"pr": pr, "builds": builds})
         else:
             obs = g.get("latest_observation") or {}
             pr_ids = obs.get("failure_pr_identifiers") or []
             note = "N/A (stage entity, no test-history)" if g.get("entity_kind") == "stage" else "N/A (no execution data)"
             for pr in pr_ids or ["n/a"]:
-                prs.append({"pr": pr, "builds": [{"build": "n/a", "date": date, "failure_message": note, "waived": "N/A", "bug": "N/A"}]})
+                row = {"build": "n/a", "job": "n/a", "stage": "n/a", "date": date, "triggered": "n/a",
+                       "base_commit": "n/a", "error": note, "waived": "N/A", "bug": "N/A"}
+                row.update(analysis_lookup(failure_type_by_key, build_analysis, key, "n/a"))
+                prs.append({"pr": pr, "builds": [row]})
 
-        nested_case = {"case_name": display_name, "prs": prs}
+        nested_case = {"case_name": display_name, "platform": g.get("platform"), "waived_latest": waived_str(g), "prs": prs}
         s = status_by_key.get(key)
         if s is not None:
             nested_case["latest_status"] = s["latest_status"]
             if s.get("regressed_since_pass"):
-                # See build_flat_cases for the reasoning - only ever forces
-                # a reset to False, never sets it otherwise. post_confluence_cases.py's
-                # nested publish path carries forward the existing page's
-                # Analyzed value for any case where this key is absent.
-                nested_case["analyzed"] = "False"
-
-        ft = failure_type_by_key.get(key)
-        if ft is not None and ft.get("failure_type"):
-            nested_case["failure_type"] = ft["failure_type"]
+                # A pass->fail regression invalidates every build's review
+                # state; post_confluence_cases.py applies this reset to the
+                # case's rows and otherwise carries Analyzed forward.
+                nested_case["reset_analyzed"] = True
 
         nested_cases.append(nested_case)
     return nested_cases
@@ -265,7 +360,9 @@ def main():
     parser.add_argument("--groups-json", required=True, help="Condensed main-break JSON from fetch_failures.py")
     parser.add_argument("--executions-json", help="Execution-detail JSON from fetch_execution_details.py (required for --mode nested; optional but recommended for --mode flat)")
     parser.add_argument("--status-json", help="Latest-status JSON from fetch_latest_status.py (optional, both modes)")
-    parser.add_argument("--failure-types-json", help="Step 4 (Analyze failure reasons) conclusions, hand-written as {\"results\": [{\"entity_name\": ..., \"platform\": ..., \"failure_type\": ...}, ...]} (optional, both modes)")
+    parser.add_argument("--failure-types-json", help="Step 4 (Analyze failure reasons) conclusions, hand-written as {\"results\": [{\"entity_name\": ..., \"platform\": ..., \"failure_type\": ..., \"analysis\": ...(optional), \"build\": ...(optional, nested mode: applies to that build only), \"analyzed\": ...(optional)}, ...]} (optional, both modes)")
+    parser.add_argument("--base-commits-json", help="get_base_commit.py output; nested mode fills each build's 'Base commit' cell from it")
+    parser.add_argument("--full-errors-dir", help="Directory holding fetch_full_error.py outputs (full_error_*.json / hist_*.json); nested mode uses a build's first failure block as its 'Error / callstack' cell when present")
     parser.add_argument("--mode", choices=["flat", "nested"], default="flat")
     parser.add_argument("--date", default=None, help="Date string to stamp cases with (default: today, YYYY-MM-DD)")
     parser.add_argument("--out", required=True, help="Output cases JSON path (feed this to post_confluence_cases.py)")
@@ -283,13 +380,10 @@ def main():
         exec_by_key = {exec_key(r["entity_name"], r.get("platform")): r for r in exec_payload.get("results", [])}
 
         if args.mode == "nested" and any(r.get("skipped_known_builds") for r in exec_by_key.values()):
-            sys.exit(
-                "--mode nested with an --executions-json that used --known-builds-json is unsafe: "
-                "post_confluence_cases.py --nested-json always fully replaces the table, so any "
-                "already-published build this run skipped fetching would silently disappear from "
-                "the republished page instead of being preserved. Re-run fetch_execution_details.py "
-                "WITHOUT --known-builds-json to get the complete picture before building nested cases."
-            )
+            # Safe since post_confluence_cases.py --nested-json merges build by
+            # build into the existing nested table (already-published builds
+            # are kept); only --replace would drop them.
+            print("note: executions JSON skipped already-published builds; the nested publish merges, so those rows are preserved on the page (do not use --replace).", file=sys.stderr)
 
     status_by_key = {}
     if args.status_json:
@@ -297,16 +391,24 @@ def main():
         status_by_key = {exec_key(r["entity_name"], r.get("platform")): r for r in status_payload.get("results", [])}
 
     failure_type_by_key = {}
+    build_analysis = {}
     if args.failure_types_json:
         failure_types_payload = json.loads(Path(args.failure_types_json).read_text())
-        failure_type_by_key = {exec_key(r["entity_name"], r.get("platform")): r for r in failure_types_payload.get("results", [])}
+        for r in failure_types_payload.get("results", []):
+            if r.get("build"):
+                build_analysis[(r["entity_name"], r.get("platform"), str(r["build"]))] = r
+            else:
+                failure_type_by_key[exec_key(r["entity_name"], r.get("platform"))] = r
 
     date = args.date or date_cls.today().isoformat()
 
     if args.mode == "flat":
         cases = build_flat_cases(groups, exec_by_key, status_by_key, failure_type_by_key, date)
     else:
-        cases = build_nested_cases(groups, exec_by_key, status_by_key, failure_type_by_key, date)
+        cases = build_nested_cases(groups, exec_by_key, status_by_key, failure_type_by_key, date,
+                                   base_by_build=load_base_commits(args.base_commits_json),
+                                   full_errors=load_full_errors(args.full_errors_dir),
+                                   build_analysis=build_analysis)
 
     Path(args.out).write_text(json.dumps(cases, indent=2))
 

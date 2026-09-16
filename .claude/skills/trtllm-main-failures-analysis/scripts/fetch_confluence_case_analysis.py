@@ -75,6 +75,25 @@ def extract_case_analysis(storage_html: str) -> dict:
             result[name] = {"failure_type": failure_type, "signature": signature}
         return result
 
+    if "error / callstack" in headers and "triggered (utc)" in headers:
+        # Nested per-build layout (post_confluence_cases.NESTED_HEADERS):
+        # Failure Type is per build, so take it from the most recently
+        # triggered build that has a real value; the signature is that
+        # build's Error / callstack cell.
+        err_idx = headers.index("error / callstack")
+        trig_idx = headers.index("triggered (utc)")
+        best: dict = {}
+        for row in grid:
+            name = row[name_idx].strip()
+            failure_type = row[ft_idx].strip()
+            if not name or failure_type.lower() in PLACEHOLDER_VALUES:
+                continue
+            trig = row[trig_idx].strip()
+            if name not in best or trig > best[name]:
+                best[name] = trig
+                result[name] = {"failure_type": failure_type, "signature": row[err_idx].strip()}
+        return result
+
     if "failure message" in headers and "date" in headers:
         # Nested mode: Failure Type is rowspan-merged per case, so every row
         # for a case repeats the same value once reconstructed - take it
