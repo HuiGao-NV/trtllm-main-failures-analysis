@@ -82,17 +82,26 @@ def latest_status(hits: list) -> tuple[str, bool, list]:
     """hits: this entity's hits already filtered to the right platform, any
     status. Returns (verdict, regressed_since_pass, recent_runs_used)."""
     by_time = sorted(hits, key=lambda h: h.get("ts") or 0, reverse=True)
-    recent = by_time[: min(3, len(by_time))]
+    # SKIPPED runs (waived on that branch, deselected, "reused from previous
+    # pipeline") carry no pass/fail information; they are reported in
+    # recent_runs but excluded from the verdict, otherwise one waived branch
+    # turns hundreds of passing entities into "Still Failing (2/3)".
+    executed = [h for h in by_time if h.get("status") in ("PASSED", "FAILED", "ERROR")]
+    recent = executed[: min(3, len(executed))]
+    skipped_recent = sum(1 for h in by_time[:3] if h.get("status") == "SKIPPED")
     if not recent:
+        if skipped_recent:
+            return f"Skipped ({skipped_recent} recent run(s) skipped/waived, none executed)", False, \
+                [{"build": h.get("build"), "status": h.get("status"), "ts": h.get("ts")} for h in by_time[:3]]
         return "N/A (no runs in last 24h)", False, []
 
     n = len(recent)
     passed = sum(1 for h in recent if h.get("status") == "PASSED")
     verdict = f"Passed ({n}/{n} recent runs)" if passed == n else f"Still Failing ({passed}/{n} recent passed)"
 
-    # Flipped from passing back to failing: the single most recent run is
-    # FAILED, but an earlier one in this same window was PASSED.
-    regressed_since_pass = recent[0].get("status") == "FAILED" and any(h.get("status") == "PASSED" for h in recent[1:])
+    # Flipped from passing back to failing: the single most recent executed
+    # run is FAILED, but an earlier one in this same window was PASSED.
+    regressed_since_pass = recent[0].get("status") != "PASSED" and any(h.get("status") == "PASSED" for h in recent[1:])
 
     recent_runs = [{"build": h.get("build"), "status": h.get("status"), "ts": h.get("ts")} for h in recent]
     return verdict, regressed_since_pass, recent_runs

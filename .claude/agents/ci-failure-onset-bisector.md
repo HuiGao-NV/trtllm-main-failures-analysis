@@ -63,7 +63,19 @@ Boundary builds first (fast), then all failing builds in the background. Base = 
 
 Also resolve bases for recent **passing** builds (`fetch_latest_status.py --groups-json ... --out ...` lists the last day's runs; feed their build ids through `get_base_commit.py`) - a pass on a base that predates a candidate fix disproves that fix.
 
-Onset range on `main` = `gh api repos/<owner>/<repo>/compare/<last_clean_base>...<first_failing_base>` (sha, date, title per commit). Compute it per platform; the ranges should overlap or nest.
+Onset range on `main` = `gh api repos/<owner>/<repo>/compare/<last_clean_base>...<first_failing_base>` (sha, date, title per commit). Compute it per platform; the ranges should overlap or nest. Report the range's span and the onset gap (last clean run → first failing run) as `x days x hours x minutes` (`<skill_dir>/durations.py`), never as bare hours.
+
+### 5b. Densify with every build's value and separate base from time (Method D)
+Before attributing over the range in step 6, rebuild the **value** timeline from PBSS per-test logs for every PR and post-merge build that ran the stage — passing builds included, since the dashboard history has failures only:
+```bash
+python3 <skill_dir>/harvest_pbss_metrics.py --job L0_MergeRequest_PR --builds <first>-<last> --job L0_PostMerge --builds <first>-<last> \
+  --stage-substring <stage> --test-regex '<test id fragment, / :: [ ] as _>' [--metric NAME=REGEX] --log-dir RUN_DIR/pbss --out RUN_DIR/metrics_SLUG.tsv
+python3 <skill_dir>/get_base_commit.py --job LLM/main/L0_MergeRequest_PR --build <b> ... --out RUN_DIR/base_commits_pr.json   # bash arrays for the repeats
+python3 <skill_dir>/get_base_commit.py --job LLM/main/L0_PostMerge --build <b> ... --out RUN_DIR/base_commits_pm.json         # post-merge: head_commit = tested main commit
+python3 <skill_dir>/metrics_by_base_commit.py --metrics-tsv RUN_DIR/metrics_SLUG.tsv --base-json RUN_DIR/base_commits_pr.json --base-json RUN_DIR/base_commits_pm.json \
+  --test-regex '<fragment>' --metric <name> --threshold <t> --out RUN_DIR/metrics_by_base_SLUG
+```
+Read the VERDICT. **time-driven** (same base → different values on different days; failing values on bases both older and newer than passing bases) means no `main` commit is the cause: skip step 6's per-commit attribution, label the case environment drift / flaky, and instead diff run-time inputs between the last passing and first failing run (stage Blue Ocean log: image, driver, installed packages, HF-cache rsync, node; per-test env dump; test order inside the stage container; wheel provenance — a `[Build TRT-LLM] Reuse` stage copies an older build's tarball, so read `reuseArtifactPath` in `Build-x86_64`). **commit-driven** gives the adjacent-base step to feed into step 6. **mixed**: bound the step, then check it holds on other days. Harvested sibling parametrizations are a free consistency check. Cite `metrics_by_base_SLUG.md` in the report and include the per-day histogram.
 
 ### 6. Attribute over the bounded range (Method C)
 For every commit in the range: file list (`gh api repos/<owner>/<repo>/commits/<sha> --jq '.files[].filename'`), classified as on-path (touches code in the victim's call stack or the tests/fixtures of the failing process), shared-subsystem, build-input (dependency pins, CI image tags, submodules, prebuilt binaries), or unrelated. For each on-path/shared commit, delegate one `ci-regression-verifier` run (one candidate per call; give it the victim callstack, the execution-order facts, the range, and an output path `RUN_DIR/verify_SLUG_<sha>.json`). Separately verify any **claimed fix** (a later commit) against the bases of builds that still fail and of builds that pass without it. If the fault is intermittent, widen once to the previous clean base and rank the newly included on-path commits too. For asynchronous device faults prefer lifetime/race/uninitialized-memory changes (streams, events, workspace or pool reuse, graph capture, scratch buffers) over pure arithmetic changes, and verify the victim's actual code path (which implementation is selected for that configuration) rather than matching by file name. If nothing explains the failure mechanically, say so plainly and hand back the ranked commit list for a hardware bisect, recommending a sanitizer/checker run on the shard with the current collection order.
@@ -80,4 +92,7 @@ For every commit in the range: file list (`gh api repos/<owner>/<repo>/commits/<
 - Bounding by wall clock instead of base commit, or using `baseRefOid`.
 - Declaring a first-victim shift "fixed" or "a new bug" without comparing identical-base builds.
 - Crediting a fix commit without checking that no later build passed without it.
+- Bounding a value/threshold onset from failing builds alone (skip of step 5b): the same base has scored 67.68, 60.10 and 54.55 on three consecutive days.
+- Reading a stage retry's pass as a fix: it runs alone in a fresh container on another node.
+- Assuming the tested wheel was built from the build's own base: `Reuse` build stages copy older tarballs.
 - Concluding a test "was not in the roll-up yet" from a truncated log - check `collected N items` and the per-test records.

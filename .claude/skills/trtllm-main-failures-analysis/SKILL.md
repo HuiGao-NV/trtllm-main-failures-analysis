@@ -26,9 +26,14 @@ Details" (Main Break) data at
   (`mkdir -p` it first). `<slug>` = `entity_name` with `/`, `::`, spaces → `_`.
   Write evidence to disk as it is produced (`full_error_*`, `verify_*`,
   `analysis_*`, `actions_*`), not only at report time.
-- **Time zones:** dashboard per-execution `ts` values are US-Pacific (UTC−7);
-  ci_report `job_info.ts_created` and GitHub commit dates are UTC. Convert before
-  comparing to commits.
+- **Time zones:** dashboard per-execution `ts` values **and the detection
+  window bounds** (`earliest_window_start`, `latest_observation.window`,
+  `latest_failure_time`) are US-Pacific (UTC−7) even when suffixed `Z`;
+  ci_report `job_info.ts_created` and GitHub commit dates are UTC. Convert
+  before comparing to commits — a "04:00Z" detector bucket was really 11:00
+  UTC and briefly looked earlier than the culprit merge. Bound onsets with
+  `job_ts_created` from `fetch_execution_details.py`, never with detector
+  windows.
 - **Dashboard limits:** `/api/incidents` accepts `days` ∈ {1, 2, 7, 30} only
   (`fetch_failures.py` snaps upward); test-history is capped at 30 days.
 - Destinations live in `scripts/confluence_config.py`,
@@ -36,29 +41,36 @@ Details" (Main Break) data at
 - Subagents (`.claude/agents/`): `ci-jenkins-log-navigator` (recover failing
   case + full error from Jenkins/Blue Ocean/PBSS/JUnit), `ci-regression-verifier`
   (True/False verdict on one candidate PR/commit diff),
-  `ci-failure-onset-bisector` (history of one case for one error signature).
+  `ci-failure-onset-bisector` (history of one case for one error signature),
+  `semantic-conflict-analyzer` (measures a two-PR semantic conflict and records
+  it in `semantic_failures_stats.jsonl`).
   Invoke via the `Agent` tool with that `subagent_type`, not a fork.
 
 ## Scripts in workflow order
 
 | Step | Script | Purpose |
 |---|---|---|
-| 0 | `fetch_confluence_known_builds.py`, `fetch_google_sheet_known_builds.py` | builds already recorded on a publish target (skip re-fetch) |
-| 0.5 | `fetch_ci_status_watermark.py`, `sync_confluence_watermark.py`, `sync_sheet_watermark.py` | dashboard "Latest update" timestamp; read/write it on a target for incremental windows |
-| 1 | `fetch_failures.py` | Main Break groups + waive status |
-| 3 | `fetch_execution_details.py` | per-execution waive/bug/short error from ci_report |
-| 4 | `fetch_full_error.py` | full error/callstack (ci_report `_pbss_log` + Blue Ocean log + JUnit archive) |
-| 4 | `fetch_confluence_case_analysis.py`, `fetch_sheet_case_analysis.py` | recorded Failure Type + error signature per case (skip unchanged) |
-| 4 | `get_base_commit.py` | true `main` base of each build (GitHub merge-base) and whether it predates a fix |
-| 7 | `fetch_latest_status.py` | last-day pass streak per entity |
-| 7 | `build_confluence_cases.py` | case JSON for both publish targets (all display formatting lives here) |
-| 7 | `post_confluence_cases.py`, `post_google_sheet_cases.py` | publish/sync cases |
-| 8 | `post_slack_message.py` | DM named Slack users |
+| 1 | `fetch_confluence_known_builds.py`, `fetch_google_sheet_known_builds.py` | builds already recorded on a publish target (skip re-fetch) |
+| 2 | `fetch_ci_status_watermark.py`, `sync_confluence_watermark.py`, `sync_sheet_watermark.py` | dashboard "Latest update" timestamp; read/write it on a target for incremental windows |
+| 3 | `fetch_failures.py` | Main Break groups + waive status |
+| 5 | `fetch_execution_details.py` | per-execution waive/bug/short error from ci_report |
+| 6 | `fetch_full_error.py` | full error/callstack (ci_report `_pbss_log` + Blue Ocean log + JUnit archive) |
+| 6 | `fetch_confluence_case_analysis.py`, `fetch_sheet_case_analysis.py` | recorded Failure Type + error signature per case (skip unchanged) |
+| 6 | `get_base_commit.py` | true `main` base of each build (GitHub merge-base) and whether it predates a fix |
+| — | `durations.py` | shared helper: `hours_between()`, `human()` → `x days x hours x minutes` (used by every script that reports a time gap) |
+| 7 | `rebase_actions.py` | PRs on pre-fix bases (`base_is_pre_fix` from `get_base_commit.py`) + their GitHub authors → `rebase_actions_<date>.json` and the report/Slack "Rebase Action:" section |
+| 7 | `semantic_failures_analysis.py` | used by the `semantic-conflict-analyzer` agent: early/late conflicting commits, late PR's last pre-merge build + base, time/commit gaps → `semantic_failures_stats.jsonl` |
+| 6 | `harvest_pbss_metrics.py`, `metrics_by_base_commit.py` | Method D: per-build metric timeline from PBSS per-test logs (passing builds included), joined to base commits, with a commit-driven / time-driven verdict |
+| 6 | `fetch_daily_pass_rate.py` | per-UTC-day pass/fail/error/skipped counts + pass rate for one or more cases, up to 30 days |
+| 9 | `fetch_latest_status.py` | last-day pass streak per entity |
+| 9 | `build_confluence_cases.py` | case JSON for both publish targets (all display formatting lives here) |
+| 9 | `post_confluence_cases.py`, `post_google_sheet_cases.py` | publish/sync cases |
+| 10 | `post_slack_message.py` | DM named Slack users |
 
 `<skill_dir>` below = this skill's directory; all commands are
 `python3 <skill_dir>/scripts/<name>.py …`.
 
-## Step 0: Known builds (only when publishing)
+## Step 1: Known builds (only when publishing)
 
 ```bash
 fetch_confluence_known_builds.py --out <run_dir>/known_builds_confluence.json     # if Confluence is a target
@@ -69,22 +81,22 @@ Pass each file to every later `fetch_execution_details.py` call as
 skipped. Don't touch a target's API/credentials unless it is a publish target.
 Skip this step entirely for report-only runs.
 
-## Step 0.5: Fetch window from the watermark (only when publishing without an explicit window)
+## Step 2: Fetch window from the watermark (only when publishing without an explicit window)
 
 1. `fetch_ci_status_watermark.py --out <run_dir>/ci_status_watermark_now.json` —
    keep for write-back after publishing.
 2. `sync_confluence_watermark.py --read --out …` / `sync_sheet_watermark.py --read --out …`
    for each publish target (ask which targets if not yet decided).
-3. `--days` for Step 1: no watermark → 7; else `max(1, ceil(hours_since/24))`,
+3. `--days` for Step 3: no watermark → 7; else `max(1, ceil(hours_since/24))`,
    using the **older** watermark when targets differ. An explicit user window
    ("last 30 days") always overrides.
-4. After a successful publish to a target (Step 7), and only then:
+4. After a successful publish to a target (Step 9), and only then:
    `sync_confluence_watermark.py --write <ts>` / `sync_sheet_watermark.py --write <ts>`
    (Sheet: write after `post_google_sheet_cases.py`).
 
 Report-only run + explicit window → skip this step.
 
-## Step 1: Fetch detections
+## Step 3: Fetch detections
 
 ```bash
 fetch_failures.py --days <N> --out <run_dir>/trtllm-failures-<N>d-<date>.json
@@ -92,15 +104,15 @@ fetch_failures.py --days <N> --include-stages --out <run_dir>/trtllm-failures-<N
 ```
 Stdout is a triage table; the JSON has `waived` / `waive_bugs` per group already.
 The default run excludes `entity_kind: "stage"` groups (no test-history); the
-second run lists them. **Stage-kind rule:** investigate stage groups (Step 4
-"Stage-kind entities") and run them through Step 5 whenever the window has
+second run lists them. **Stage-kind rule:** investigate stage groups (Step 6
+"Stage-kind entities") and run them through Step 7 whenever the window has
 zero test-kind groups, the user asks about a stage, a stage recurs across
 windows, or it has no explaining dashboard comment; otherwise list them with
-PRs/window/comment and investigate only those Step 2 flags. "Not
+PRs/window/comment and investigate only those Step 4 flags. "Not
 investigated" is never the final state for a stage in an otherwise empty
 window.
 
-## Step 2: Triage (no network)
+## Step 4: Triage (no network)
 
 - High confidence first (>5 failing PRs, or a PostMerge failure with zero
   passes — see `confidence_reason`); then higher `failure_count` /
@@ -113,7 +125,7 @@ window.
   far more frequent than the waive explains).
 - Typically 10–20 entities get write-ups; the rest are table rows.
 
-## Step 3: Execution details
+## Step 5: Execution details
 
 ```bash
 fetch_execution_details.py --groups-json <picks.json> [--hours 720] \
@@ -126,12 +138,13 @@ representatives you will investigate, not all groups, unless publishing.
 `--hours` should match the window (default 168). Stage-kind entities are
 skipped. Jenkins/NVDF links in the output may be fetched directly.
 
-## Step 4: Analyze
+## Step 6: Analyze
 
 Apply the methods in order; the first confident hit ends the analysis for that
-group. Write `<run_dir>/analysis_<slug>.json` as soon as a group concludes.
+group. For threshold/value failures run Method D before crediting any Method C
+candidate — a range bounded from failures alone has been wrong before. Write `<run_dir>/analysis_<slug>.json` as soon as a group concludes.
 
-### 4.0 Stage-kind entities
+### 6.0 Stage-kind entities
 Group stages sharing PR set + window (often one incident), then send each group
 to `ci-jenkins-log-navigator` with stage name(s), platform, PRs, window, and the
 group's `links.stage_dashboard` / `source_build_url` / `nvdf_document_url`
@@ -142,7 +155,7 @@ artifacts, and return the failing case(s) + full error, and whether all PRs hit
 the identical error. Output path `<run_dir>/full_error_<slug>.json`. Then treat
 each recovered case as a normal case below.
 
-### 4.1 Skip unchanged cases (only when publishing)
+### 6.1 Skip unchanged cases (only when publishing)
 ```bash
 fetch_confluence_case_analysis.py --out <run_dir>/case_analysis_confluence.json
 fetch_sheet_case_analysis.py --out <run_dir>/case_analysis_sheet.json
@@ -152,7 +165,7 @@ build ids/timestamps; a different exception, file/line or symptom counts as a
 change), reuse the recorded `failure_type`, write `analysis_<slug>.json` with
 `"method": "skip-unchanged"`, and skip Methods A–C.
 
-### 4.2 Always get the full error first
+### 6.2 Always get the full error first
 `short_error_msg` is truncated at the source and has led to a wrong attribution
 before. For every analyzed group run, on one representative execution:
 ```bash
@@ -177,7 +190,7 @@ per-test logs
 For roll-ups, take the first failure in JUnit **execution order** as the
 victim; setup errors after a device fault are cascade, not origin.
 
-### 4.3 Standard opening line for every investigation subagent
+### 6.3 Standard opening line for every investigation subagent
 ```
 test case [Case Name] meets error "[Error Message]". Check when this test
 case is added. Check the commit history to analyze what does the failure
@@ -189,6 +202,34 @@ fullest text available (prefer `blocks[].text`). Append the method-specific
 instructions after it. The three asks map to: test provenance
 (`gh api "repos/NVIDIA/TensorRT-LLM/commits?path=<test file>&sha=main"`),
 diff-grounded mechanism, and a fix-commit search after the window.
+
+### 6.4 Daily pass-rate history for a case
+Use whenever someone asks to "review the history of case `<X>`", wants its
+day-by-day pass rate, or Method C/D's bounded range needs an independent
+day-level view of pass/fail (not just PR groupings) to sanity-check an onset:
+```bash
+fetch_daily_pass_rate.py --entity '<entity_name>' [--entity '<entity_name2>' ...] \
+  --hours 720 --out <run_dir>/daily_pass_rate_<slug>.json \
+  --md-out <run_dir>/daily_pass_rate_<slug>.md
+```
+`--entity` reports every platform seen for that name plus an `ALL` combined
+row; use `--entity-platform NAME PLATFORM` (repeatable) to restrict to one.
+`NAME` must be the dashboard's own `entity_name` form (file path, `file::Class::test`,
+or bare `file.py::test`) — **not** a shorthand like `test_x[a|b-...]` for two
+separate parametrizations; verify the real id(s) first (`gh api
+"search/code?q=<test function name>+repo:NVIDIA/TensorRT-LLM"`, then read the
+`@pytest.mark.parametrize` ids, or grep `tests/integration/test_lists/waives.txt`
+/ the QA lists for the exact bracketed id) — a wrong/combined name silently
+returns 0 hits rather than erroring. `--hours` caps at 720 (30 days, the
+dashboard's own cap). Zero-executed days (all `SKIPPED`, e.g. from a waive)
+report `pass_rate: null`, not `0.0` — read that as "no signal", not "100% failing".
+
+A day-by-day table that goes from 100% straight to `null`/all-skipped is the
+signature of a waive landing, not a recovery: cross-check by finding when the
+SKIP line was added to `waives.txt` (`gh api
+"repos/NVIDIA/TensorRT-LLM/commits?path=tests/integration/test_lists/waives.txt&sha=main&since=<onset>&until=<onset+2d>"`,
+then grep each candidate commit's patch for the entity's bracketed id) — the
+PR/commit that added it usually names the nvbug and the triggering build.
 
 ### Method A — infra signature
 Error text matching **device error**, **failed to load weights**, **unable to
@@ -233,21 +274,76 @@ For every PR behind the group's recent failures, run `ci-regression-verifier`
    async device faults, and if nothing fits mechanically say so and hand back a
    ranked list for a hardware bisect / sanitizer run.
 
+### Method D — base-vs-time separation (dense value timeline)
+Use when the failure is a **value crossing a threshold** (accuracy, perf, timeout
+margin) or whenever Method C does not close cleanly: the bounded range contains
+no mechanically plausible commit, identical bases give different outcomes, a
+retry of the same wheel passes, or the "onset" was inferred from failures only.
+The dashboard's test-history lists failures only; the passing builds carry the
+signal that separates a commit from an environment change, and PBSS keeps every
+per-test `stdout.log` for PR and post-merge builds
+(`main/L0_MergeRequest_PR/<build>/<stage>/…/stdout.log`, `main/L0_PostMerge/<build>/…`).
+1. Harvest the metric for **every** build that ran the stage in the window (both
+   jobs; a wide build range is cheap — builds without the stage are listed as
+   `<no-stage>`):
+   ```bash
+   harvest_pbss_metrics.py --job L0_MergeRequest_PR --builds <first>-<last> \
+     --job L0_PostMerge --builds <first>-<last> --stage-substring <stage> \
+     --test-regex '<test id fragment with / :: [ ] as _>' \
+     [--metric NAME=REGEX]... --log-dir <run_dir>/pbss --out <run_dir>/metrics_<slug>.tsv
+   ```
+   Defaults extract lm-eval accuracies (`gpqa`, `gsm8k`, `mmlu`, `Evaluated accuracy`,
+   `but got N`). One row per attempt: a stage retry yields two rows for one build.
+2. Resolve bases for every harvested build with the **full** job names
+   (`--job LLM/main/L0_MergeRequest_PR --build N` … and `--job LLM/main/L0_PostMerge
+   --build N`; post-merge builds report the tested `main` commit as `head_commit`).
+   Bash arrays, not an unquoted string, for the repeated flags (zsh does not
+   word-split).
+3. Join and judge:
+   ```bash
+   metrics_by_base_commit.py --metrics-tsv <run_dir>/metrics_<slug>.tsv \
+     --base-json <run_dir>/base_commits_pr.json --base-json <run_dir>/base_commits_pm.json \
+     --test-regex '<same fragment>' --metric gpqa --threshold <threshold> \
+     --out <run_dir>/metrics_by_base_<slug>
+   ```
+   It prints the same-base/different-day groups, the per-day histogram, the
+   threshold interleave test and a **VERDICT**:
+   - **commit-driven** — every base has one value and the failing value starts
+     at one base and persists → take the adjacent-base step it prints into
+     Method C step 3 (verify the commits in that step's compare range).
+   - **time-driven** — the same base scores differently on different days and
+     failing values sit on bases both older and newer than passing bases → **do
+     not attribute to a `main` commit**. Label **Flaky test** (environment
+     drift) and, for the report, compare run-time inputs between the last
+     passing and first failing run: stage Blue Ocean log (image tag, driver,
+     `Successfully installed` lines, HF-cache rsync, node), per-test env dump,
+     test order inside the stage container (`TLLM_AUTOTUNER_CACHE_PATH` is
+     container-local per attempt), and the **wheel provenance** — a
+     `[Build TRT-LLM] Reuse` stage copies an older build's tarball, so the wheel
+     can predate the build by days (check `Build-x86_64` for `reuseArtifactPath`).
+   - **mixed** — bound the base-ordered step with Method C, then confirm the
+     step survives on other days before crediting a commit.
+   Sibling params of the same test (other parametrizations in the stage) are
+   harvested for free and often move in the same windows; use them as a check.
+4. Record `"method": "D"` in `analysis_<slug>.json` with the verdict, the
+   `metrics_by_base_<slug>.md` path, and the per-day histogram in `reasoning`.
+
 ### Labels and `analysis_<slug>.json`
-- **Infra failure** · **Regression (PR #N | commit sha)** · **PR-own defect**
-  · **Flaky test** (mixed pass/fail, few PRs, no attribution) ·
-  **Unresolved** (methods exhausted).
+- **Infra failure** · **Regression (PR #N | commit sha)** · **Semantic conflict
+  (early sha × late sha)** (see Step 7) · **Test leak (commit sha)** (see
+  Step 7) · **PR-own defect** · **Flaky test** (mixed pass/fail, few PRs, no
+  attribution) · **Unresolved** (methods exhausted).
 ```json
-{"entity_name": "...", "platform": "...", "method": "A | B | C | skip-unchanged",
- "category": "Infra failure | Regression (PR #123) | Regression (commit abc1234) | PR-own defect | Flaky test | Unresolved",
+{"entity_name": "...", "platform": "...", "method": "A | B | C | D | skip-unchanged",
+ "category": "Infra failure | Regression (PR #123) | Regression (commit abc1234) | Semantic conflict (early abc1234 x late def5678) | Test leak (commit abc1234) | PR-own defect | Flaky test | Unresolved",
  "attributed_pr": null, "attributed_commit": null, "fix_commit": null,
  "reasoning": "<mechanism + evidence>", "confidence": "low | medium | high",
  "waived": false, "evidence_files": ["<run_dir>/full_error_<slug>.json", "..."]}
 ```
-Only entities analyzed this run go into Step 7's `--failure-types-json`;
+Only entities analyzed this run go into Step 9's `--failure-types-json`;
 skipped ones keep their recorded type.
 
-## Step 5: Dispatch to handlers and record actions
+## Step 7: Dispatch to handlers and record actions
 
 For every `analysis_<slug>.json`, pick the first matching handler and write
 `<run_dir>/actions_<slug>.json` plus a consolidated
@@ -256,10 +352,11 @@ nothing outward-facing happens here.
 
 | Handler | When | Record | Actions |
 |---|---|---|---|
-| `infra` | Infra failure | component, recovery (`fetch_latest_status.py` / later builds), INFRA-RETRY "no infra pattern matched" strings | `notify-infra`, `add-infra-retry-pattern <strings>`, `no-code-action` (never a waive) |
-| `regression-fixed` | Regression with fix on main | fix commit/time, pre-fix base count | `rebase-affected-prs <PRs>`; post-fix-base failures → `split-off` back to Step 4 |
-| `regression-open` | Regression, no fix | culprit, mechanism, `blast_radius_groups` | per the blast-radius rule below: > 3 groups → `find-culprit-and-revert <commit>`; 1–2 groups → `propose-waive <waives.txt line>` + `file-or-link-nvbug`; plus `notify-author` (sent only via Step 8) |
+| `infra` | Infra failure | component, recovery (`fetch_latest_status.py` / later builds), INFRA-RETRY "no infra pattern matched" strings | `notify-infra` (recipient = `INFRA_TEAM_RECIPIENT` placeholder from `slack_config.py`; **no PR/author lookup** — infra failures have no culprit PR), `add-infra-retry-pattern <strings>`, `no-code-action` (never a waive) |
+| `regression-fixed` | Regression with fix on main | fix commit/time, pre-fix base count, `rebase_actions_<date>.json` | `rebase-affected-prs <PRs>` (PR list + authors via `rebase_actions.py`, below); post-fix-base failures → `split-off` back to Step 6 |
+| `regression-open` | Regression, no fix | culprit, mechanism, `blast_radius_groups` | per the blast-radius rule below: > 3 groups → `find-culprit-and-revert <commit>`; 1–2 groups → `propose-waive <waives.txt line>` + `file-or-link-nvbug`; plus `notify-author` (sent only via Step 10) |
 | `pr-own-defect` | culprit is the failing PR itself | mechanism | `comment-on-pr`, `exclude-from-case-log` |
+| `test_leak` | single introducing commit, its own pre-merge CI didn't run/block on this test (see Step 7 "Test leak") | introducing commit, whether the PR's own build ran this test and what happened, fix commit if any | same as `regression-fixed`/`regression-open` (rebase or revert per blast radius) **plus** `flag-ci-gating-gap <test>` noting the coverage hole so it doesn't recur |
 | `flaky` | Flaky test | counts, pattern, waive state | `link-nvbug`/`file-nvbug`, `propose-waive`, `request-owner-triage` |
 | `unresolved` | Unattributed | bounded range, ranked candidates, intermittency | `hardware-bisect <range>`, `sanitizer-run <shard>`, `request-owner-triage`, `track-daily` |
 
@@ -296,7 +393,70 @@ report states the true blast radius, but their action stays
  "evidence_files": ["<run_dir>/analysis_<slug>.json"]}
 ```
 
-## Step 6: Report
+
+**Rebase list (every `rebase-affected-prs` action).** Do not type the PR
+list by hand: a PR needs a rebase exactly when one of its failing builds ran
+on a `main` base that predates the fix (`base_is_pre_fix: true` in the
+`get_base_commit.py --fix-commit <fix>` output). Run
+```bash
+rebase_actions.py --base-commits-json <run_dir>/base_commits_<date>.json [--base-commits-json …] \
+  [--actions-json <run_dir>/actions_<date>.json] [--pr <n> …] --fix-commit <fix sha> \
+  --entity "<Pn short problem label>" --out <run_dir>/rebase_actions_<date>.json \
+  --md-out <run_dir>/rebase_actions_<date>.md --slack-out <run_dir>/rebase_actions_slack_<date>.md
+```
+once per fix commit (a window with two fixed problems → two files, suffix the
+label). It looks up each PR's author (`gh api repos/<repo>/pulls/<n>` login +
+display name), drops PRs already merged/closed into `skipped`, and writes
+`{"fix_commit", "prs": [{"pr", "author", "author_name", "title", "state",
+"builds", "base_commits", "url"}], "skipped", "authors": {login: [prs]}}`.
+Put the resulting `prs` numbers into the action's `"prs"` list and the file
+into `evidence_files`; the `.md` / Slack snippets feed Step 8 and Step 10
+verbatim. Only `regression-fixed` groups get a rebase list — while the fix is
+still open (`regression-open`), record `rebase-affected-prs` with the note
+"once fixed: N PRs" and no author lookup. `infra` groups never get one:
+their `notify-infra` action carries `"recipient": "<INFRA_TEAM_RECIPIENT>"`
+(the placeholder in `slack_config.py`), not a PR author — do not run
+`rebase_actions.py` or `gh api …/pulls/<n>` for an infra failure.
+
+**Semantic conflicts.** A *semantic conflict* is defined purely behaviorally, not
+by what kind of change either side made: **PR A merged first and, alone, did not
+cause this test to fail; PR B merged later and, alone, also did not cause this
+test to fail; but once both are on `main` together, some logic conflict between
+them makes the test fail.** Neither PR individually reproduces the break —
+verify this before calling it a semantic conflict (check each PR's own
+pre-merge CI for this test, or its base commit against just one side). It does
+NOT require one side to be an "interface change" and the other a "stale
+consumer" — any two-sided logic incompatibility qualifies (fixtures, ordering,
+resource contention, config defaults, anything), as long as each side is
+independently clean. If a *single* commit's own pre-merge build already
+reproduces the failure (that PR alone is red), this is not a semantic conflict
+— see **test_leak** below instead.
+
+When a `regression-*` group is a genuine two-PR semantic conflict, delegate the
+measurement to the `semantic-conflict-analyzer` agent (entities, the two
+commits, fix, `RUN_DIR`, label). It writes `RUN_DIR/semantic_<label>.{json,md}`
+and appends the record to `./semantic_failures_stats.jsonl`; quote its gap table
+in the investigation section.
+
+**Test leak.** Use category `test_leak` instead of a plain `Regression (commit
+…)` when a *single* introducing commit is responsible (no second PR needed to
+reproduce it), but that commit's own pre-merge CI did not run this test case
+against its true final head before merging — the stage wasn't scheduled on the
+final head, the test was treated as non-blocking/out of gate scope, or a
+failure was observed but merged anyway. The defect existed at merge time and
+was verifiable, but the gate let it leak onto `main` regardless — that gap in
+pre-merge verification is the reportable finding, distinct from an ordinary
+regression where the introducing PR's own CI was clean. Confirm with
+`get_base_commit.py`/`ci-jenkins-log-navigator` that the introducing PR's own
+build for this test either didn't run on the final head or ran and failed
+without blocking the merge, and say which in `reasoning`.
+
+## Step 8: Report
+
+**Durations.** Every time difference that reaches a report or a record (onset
+gap, bounded range span, base staleness, time-to-merge, time-to-fix) is written
+as `x days x hours x minutes` (`scripts/durations.py: human()` /
+`duration_between()`); keep numeric hours only as an extra field for statistics.
 
 `<run_dir>/trtllm-main-failures-report-<date>.md`:
 ```markdown
@@ -315,8 +475,17 @@ Generated: <date>. Source: trtllm-infra stability report, Detection Details (Mai
 ### <entity_name> (<platform>)
 - Confidence / window / failure mode / mechanism (evidence files) / verify step / links
 
-## Actions (from Step 5)
+## Actions (from Step 7)
 | Entity | Platform | Failure type | Handler | Blast radius (groups) | Actions | Owner | Status |
+
+## Rebase Action:
+<contents of rebase_actions_<date>.md, one block per fix commit: intro line
+naming the fix and problem, then>
+| PR | Author | Title | Failing builds |
+By author:
+- @<login>: #PR #PR …
+(omit the section only when no group is `regression-fixed`; write `_None._`
+if the handler fired but every affected PR is already merged/closed)
 
 ## PR-own defects (excluded from the case log)
 ## Waived / Already Tracked
@@ -327,7 +496,7 @@ Generated: <date>. Source: trtllm-infra stability report, Detection Details (Mai
 Then give a short chat summary (headline, worst offenders, cross-cutting
 issues) and the report path.
 
-## Step 7: Publish cases (only if asked)
+## Step 9: Publish cases (only if asked)
 
 Targets: **Confluence** (`CONFLUENCE_PAGE_URL`) and/or **Google Sheet**
 (`SPREADSHEET_URL`; flat only). If no target is named, ask (don't default to
@@ -348,7 +517,7 @@ builds get their refreshable cells updated, rows only on the page are kept,
 explicit per-build value). The legacy flat layout (`--cases-json`) remains for
 the Sheet and for a page that still carries the flat table.
 
-1. Known builds per target (Step 0 output, or fetch now) — the nested reader
+1. Known builds per target (Step 1 output, or fetch now) — the nested reader
    takes them from the `Build` column.
 2. `fetch_execution_details.py` on the **full** `fetch_failures.py` output with
    every `--known-builds-json` → incremental executions (already-published
@@ -359,7 +528,11 @@ the Sheet and for a page that still carries the flat table.
    `reset_analyzed` only on `regressed_since_pass`; never write `"True"` yourself).
 4. `get_base_commit.py --executions-json <exec.json> --fix-commit <any sha> --out <run_dir>/base_commits_<date>.json`
    for every build in the exec JSON (skip only if the run has no new builds).
-5. Build the nested cases:
+5. Build the nested cases. If `fetch_execution_details.py` skipped every
+   build of a case (nothing new), the builder still emits one placeholder row
+   per PR (`build: "n/a"`, error `N/A (no execution data)`); strip those rows
+   before publishing (keep the case entry so `Latest Status` / `Waived` still
+   refresh — `merge_nested` accepts a case with an empty `prs` list):
    ```bash
    build_confluence_cases.py --groups-json <failures.json> --executions-json <exec.json> \
      --status-json <status.json> --failure-types-json <run_dir>/failure_types.json \
@@ -371,10 +544,10 @@ the Sheet and for a page that still carries the flat table.
    this run: an entry without `build` applies to every build of the entity; an
    entry with `build` overrides that build only (use it when builds of one case
    have different causes, e.g. stale-base vs. new failure). `analysis` = the
-   Step 4 conclusion from error message/callstack + commit history, ending
-   with Step 5's primary action. Flat mode is unchanged
+   Step 6 conclusion from error message/callstack + commit history, ending
+   with Step 7's primary action. Flat mode is unchanged
    (`--mode flat --out cases_<date>.json`).
-6. Publish, then write the watermark (Step 0.5 step 4):
+6. Publish, then write the watermark (Step 2 step 4):
    ```bash
    post_confluence_cases.py --nested-json <cases_nested.json>   # merge; --replace only to convert a flat page
    sync_confluence_watermark.py --write <ts>
@@ -399,11 +572,16 @@ the Sheet and for a page that still carries the flat table.
    any schema migration, and before any `--replace` (flat→nested conversion)**; use `--dry-run` to
    show the exact row changes. Each target is confirmed independently.
 
-## Step 8: Slack notification (only if asked)
+## Step 10: Slack notification (only if asked)
 
-No stored recipients: send only to people the user names (email or `U…` id,
-`--user` repeatable, individual DMs). If no one is named and no owner is
-identifiable from the dashboard comment, ask. Credentials:
+No stored recipients for case DMs: send only to people the user names
+(email or `U…` id, `--user` repeatable, individual DMs). If no one is named
+and no owner is identifiable from the dashboard comment, ask. The one
+exception is `notify-infra`: its recipient is the infra-team placeholder
+`INFRA_TEAM_RECIPIENT` in `scripts/slack_config.py`, never a PR author —
+while it is still the literal placeholder, write the infra notification
+to `<run_dir>/slack_infra_<date>.md`, show it, and tell the user the
+placeholder must be filled in before it can be sent. Credentials:
 `~/.config/slack/credentials.json` (`{"bot_token": "xoxb-…"}`, scopes
 `chat:write`, `users:read.email`).
 
@@ -425,19 +603,43 @@ text as `&amp; &lt; &gt;`; keep a DM under ~3,500 characters, ending with
 
 *1. `<entity_name>`* (<platform>)
 • *Waived:* Y (nvbugs/…) | N
-• *Type:* <Step 4 label>
+• *Type:* <Step 6 label>
 • *Reason:* <one sentence from analysis_<slug>.json>
 • *PRs / builds:* #PR(build, …) …
-• *Action:* <primary action from actions_<slug>.json>
+• *Action:* <action 1>; <action 2>; …
 • *Status:* open | recovered | fixed-awaiting-rebase | waived
 • *Error:*
 ```<representative error, ≤ 3 lines>```
+
+*Rebase Action:* rebase past `<fix sha>` — <problem label>
+• <#PR link> — @<author login>
+• …
 
 _Cross-cutting:_ <shared infra or root cause>
 _Report:_ `<run_dir>/trtllm-main-failures-report-<date>.md`
 ```
 Order blocks as the report does; in a window with no case-level entities use
 the same layout for the investigated stage-level entities.
+
+Field rules:
+- **PRs / builds** — which CI runs the failure was seen in: each failing PR
+  number (`#19198`) followed, in parentheses, by the `L0_MergeRequest_PR`
+  orchestrator build numbers of that PR that hit it (`#19198(60720, 60797)`),
+  then post-merge builds as `post-merge 2965`. Entries are separated by
+  spaces. It is the evidence set for the block, not the PRs' fault — PRs are
+  listed because they were broken *by* main. Long lists (> ~8 PRs) collapse
+  to a count plus `(list in report)`; builds added since the previous run
+  may be prefixed `new`.
+- **Rebase Action** — paste `rebase_actions_slack_<date>.md` from Step 7 (one
+  block per fix commit) after the case blocks; every open PR with its author's
+  GitHub login, one per `•` line, so the recipient can ping people directly.
+  Omit the block when no group is `regression-fixed`; it counts toward the
+  ~3,500-character budget, so collapse to `N PRs / M authors (list in report)`
+  plus the by-author lines if the DM would overflow.
+- **Action** — every action from `actions_<slug>.json` in priority order,
+  joined with `; ` (`file-nvbug; propose-waive full:…; notify-author #19108`).
+  Never join actions with `+`, `&`, `and` or commas; one action per `;`
+  segment so the line can be split mechanically.
 
 ## Pitfalls (each cost a wrong conclusion before)
 
@@ -458,3 +660,14 @@ the same layout for the investigated stage-level entities.
 - Leaving stage-kind detections "not investigated" in a window with nothing
   else.
 - Mixing dashboard (UTC−7) and commit (UTC) times.
+- Bounding an accuracy/threshold onset from failing builds only: the passing
+  builds' values (PBSS per-test logs, Method D) showed the same `main` base
+  scoring 67.68, 60.10 and 54.55 on three consecutive days — no commit was
+  responsible, and two earlier attributions had to be withdrawn.
+- Assuming a build's wheel was compiled from its own base at build time: the
+  `[Build TRT-LLM] Reuse` stage copies an earlier build's tarball
+  (`reuseArtifactPath`), so build-time inputs must be read from the producing
+  `Build-x86_64` run.
+- Treating a stage retry that passes as proof of a fix: the retry runs alone in
+  a fresh container (different autotuner-cache/test-order state) and on another
+  node; compare it with same-day, same-base first attempts.
