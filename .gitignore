@@ -2,8 +2,10 @@
 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*/
 artifacts/
 *.tar.gz
-# local machine state
-.claude/settings.local.json
+# local machine state (.claude/ is a local Claude Code convention dir, not
+# part of this repo's published layout - the canonical skill/agents copies
+# live at top-level skills/ and agents/)
+.claude/
 __pycache__/
 *.pyc
 *.swp

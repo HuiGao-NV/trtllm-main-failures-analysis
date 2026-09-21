@@ -8,19 +8,20 @@ Confluence case log / Google Sheet, and optional Slack notifications.
 ## Layout
 
 ```
-.claude/
-  skills/trtllm-main-failures-analysis/
-    SKILL.md            # the workflow: Steps 0–8
-    scripts/            # every access to the dashboard / ci_report / Confluence / Sheets / Slack
-    evals/
-  agents/
-    ci-jenkins-log-navigator.md   # recovers failing case + full error from Jenkins/Blue Ocean/PBSS/JUnit artifacts
-    ci-regression-verifier.md     # diff-level True/False verdict for one candidate PR/commit
-    ci-failure-onset-bisector.md  # history of one case for one error signature: first build/PR/base commit, bounded range
+skills/trtllm-main-failures-analysis/
+  SKILL.md            # the workflow
+  scripts/            # every access to the dashboard / ci_report / Confluence / Sheets / Slack
+  evals/
+agents/
+  ci-jenkins-log-navigator.md    # recovers failing case + full error from Jenkins/Blue Ocean/PBSS/JUnit artifacts
+  ci-regression-verifier.md      # diff-level True/False verdict for one candidate PR/commit
+  ci-failure-onset-bisector.md   # history of one case for one error signature: first build/PR/base commit, bounded range
+  semantic-conflict-analyzer.md  # measures a two-PR semantic-conflict main break
 ```
 
-Clone into (or copy `.claude/` into) the project directory where Claude Code
-runs; the skill is then invoked automatically for questions like "what's
+Copy `skills/trtllm-main-failures-analysis/` into `.claude/skills/` and
+`agents/*.md` into `.claude/agents/` of the project directory where Claude
+Code runs; the skill is then invoked automatically for questions like "what's
 breaking on trtllm main", or explicitly with `/trtllm-main-failures-analysis`.
 
 ## Workflow (SKILL.md)
