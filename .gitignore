@@ -10,7 +10,7 @@ __pycache__/
 *.pyc
 *.swp
 .DS_Store
-# credentials never live in the repo (~/.config/{confluence,gsheets,slack}/)
+# credentials never live in the repo (~/.config/{confluence,gsheets,slack,github}/)
 credentials.json
 service_account.json
 apps_script.json

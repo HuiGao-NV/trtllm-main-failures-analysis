@@ -46,12 +46,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from github_config import gh_env  # noqa: E402
+
 DEFAULT_REPO = "NVIDIA/TensorRT-LLM"
 
 
 def gh_json(args: list[str], timeout: int = 30):
     try:
-        result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout, env=gh_env())
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         print(f"  gh invocation failed: {e}", file=sys.stderr)
         return None

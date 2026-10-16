@@ -59,6 +59,7 @@ Details" (Main Break) data at
 | 6 | `get_base_commit.py` | true `main` base of each build (GitHub merge-base) and whether it predates a fix |
 | — | `durations.py` | shared helper: `hours_between()`, `human()` → `x days x hours x minutes` (used by every script that reports a time gap) |
 | 7 | `rebase_actions.py` | PRs on pre-fix bases (`base_is_pre_fix` from `get_base_commit.py`) + their GitHub authors → `rebase_actions_<date>.json` and the report/Slack "Rebase Action:" section |
+| 7 | `problem_commits.py` | commit sha, PR, author, commit time (UTC) and PR merge time for every commit/PR involved in a problem (culprit / early / late / fix) → `problem_commits_<label>.{json,md}` + Slack snippet |
 | 7 | `semantic_failures_analysis.py` | used by the `semantic-conflict-analyzer` agent: early/late conflicting commits, late PR's last pre-merge build + base, time/commit gaps → `semantic_failures_stats.jsonl` |
 | 6 | `harvest_pbss_metrics.py`, `metrics_by_base_commit.py` | Method D: per-build metric timeline from PBSS per-test logs (passing builds included), joined to base commits, with a commit-driven / time-driven verdict |
 | 6 | `fetch_daily_pass_rate.py` | per-UTC-day pass/fail/error/skipped counts + pass rate for one or more cases, up to 30 days |
@@ -418,6 +419,21 @@ their `notify-infra` action carries `"recipient": "<INFRA_TEAM_RECIPIENT>"`
 (the placeholder in `slack_config.py`), not a PR author — do not run
 `rebase_actions.py` or `gh api …/pulls/<n>` for an infra failure.
 
+**Involved commits (every problem with a culprit or fix).** For each problem
+(P1, P2, …) list every commit/PR involved — culprit (or early + late for a
+semantic conflict) and the fix, if any — with its short sha, PR, author,
+**commit time and PR merge time in UTC**. Generate it, do not type it:
+```bash
+problem_commits.py --entity "<Pn short problem label>" \
+  --commit culprit=<sha|#PR> [--commit early=… --commit late=…] [--commit fix=<sha|#PR>] \
+  --out <run_dir>/problem_commits_<label>.json --md-out <run_dir>/problem_commits_<label>.md \
+  --slack-out <run_dir>/problem_commits_slack_<label>.md
+```
+The first `--commit` is the time origin for the "After first" gap
+(`x days x hours x minutes`). Times are GitHub UTC; never convert them with
+dashboard times. Put the file in the action's `evidence_files`; the `.md` /
+Slack snippets feed Step 8 and Step 10 verbatim.
+
 **Semantic conflicts.** A *semantic conflict* is defined purely behaviorally, not
 by what kind of change either side made: **PR A merged first and, alone, did not
 cause this test to fail; PR B merged later and, alone, also did not cause this
@@ -477,6 +493,9 @@ Generated: <date>. Source: trtllm-infra stability report, Detection Details (Mai
 
 ## Actions (from Step 7)
 | Entity | Platform | Failure type | Handler | Blast radius (groups) | Actions | Owner | Status |
+
+## Commits Involved
+<contents of problem_commits_<label>.md, one table per problem: Role / Commit / PR / Title / Author / Commit time (UTC) / PR merged (UTC) / After first>
 
 ## Rebase Action:
 <contents of rebase_actions_<date>.md, one block per fix commit: intro line
@@ -611,6 +630,10 @@ text as `&amp; &lt; &gt;`; keep a DM under ~3,500 characters, ending with
 • *Error:*
 ```<representative error, ≤ 3 lines>```
 
+*Commits involved:*
+• <role>: `<sha12>` #<PR> @<author> — commit <commit time UTC>, PR merged <PR merge time UTC>
+• …
+
 *Rebase Action:* rebase past `<fix sha>` — <problem label>
 • <#PR link> — @<author login>
 • …
@@ -630,6 +653,12 @@ Field rules:
   listed because they were broken *by* main. Long lists (> ~8 PRs) collapse
   to a count plus `(list in report)`; builds added since the previous run
   may be prefixed `new`.
+- **Commits involved** — paste `problem_commits_slack_<label>.md` (one per
+  block's problem: culprit/early/late/fix with sha, PR, author, UTC commit
+  time and PR merge time) right after the block's `Error`; omit only when the problem has no
+  identified commit (infra, unresolved). It counts toward the character
+  budget; if the DM would overflow, keep culprit and fix lines and point to
+  the report for the rest.
 - **Rebase Action** — paste `rebase_actions_slack_<date>.md` from Step 7 (one
   block per fix commit) after the case blocks; every open PR with its author's
   GitHub login, one per `•` line, so the recipient can ping people directly.

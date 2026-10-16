@@ -49,13 +49,14 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from durations import human, parse_iso  # noqa: E402
+from github_config import gh_env  # noqa: E402
 
 REPO = "NVIDIA/TensorRT-LLM"
 CI_REPORT = "http://tensorrt-llm.tensorrt-llm-ci-report.sc2-paas.nvidia.com/api/job/LLM%2Fmain%2FL0_MergeRequest_PR/"
 
 
 def gh(args, default=None):
-    r = subprocess.run(["gh", "api", *args], capture_output=True, text=True)
+    r = subprocess.run(["gh", "api", *args], capture_output=True, text=True, env=gh_env())
     if r.returncode != 0 or not r.stdout.strip():
         return default
     try:
