@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Service manager for the CI-analysis Slack bot (same shape as repair-bot's
+# slack-ai-agent): nohup + PID file, no systemd/tmux/docker.
+#
+# Usage: slack_bot/slack-bot {setup|start [--foreground]|stop [--force]|restart|status|logs}
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$SCRIPT_DIR"
+
+VENV_DIR="$SCRIPT_DIR/.venv"
+OUT_DIR="$SCRIPT_DIR/out"
+LOG_FILE="$OUT_DIR/app.log"
+PID_FILE="$OUT_DIR/app.pid"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <command> [options]
+
+  setup                 create .venv (uv or python3 -m venv) and install requirements
+  start [--foreground]  sync skills/agents into .claude/, start the bot (background by default)
+  stop  [--force]       SIGTERM (then SIGKILL with --force or after 10 s)
+  restart
+  status
+  logs                  tail -f the bot log
+EOF
+  exit 1
+}
+
+get_pid() { [[ -f "$PID_FILE" ]] && cat "$PID_FILE" || true; }
+is_running() { local p; p=$(get_pid); [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; }
+
+activate_venv() {
+  if [[ -n "${VIRTUAL_ENV:-}" || -n "${CONDA_PREFIX:-}" ]]; then return; fi
+  if [[ -f "$VENV_DIR/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+  else
+    echo "No venv at $VENV_DIR - run: $(basename "$0") setup" >&2
+    exit 1
+  fi
+}
+
+do_setup() {
+  if command -v uv >/dev/null 2>&1; then
+    uv venv "$VENV_DIR" --python 3.12 2>/dev/null || uv venv "$VENV_DIR"
+    uv pip install --python "$VENV_DIR/bin/python" -r requirements.txt
+  else
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install -r requirements.txt
+  fi
+  [[ -f .env ]] || { cp .env.example .env; chmod 600 .env; echo "Created .env from .env.example - fill in SLACK_APP_TOKEN (and SLACK_BOT_TOKEN unless ~/.config/slack/credentials.json has it)."; }
+  echo "Setup done."
+}
+
+# Claude Code discovers skills/agents from <cwd>/.claude/; this repo keeps the
+# canonical copies at top level, so mirror them before every start.
+sync_claude_dir() {
+  mkdir -p "$REPO_ROOT/.claude/skills" "$REPO_ROOT/.claude/agents"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete --exclude 'runs/' --exclude 'artifacts/' --exclude '__pycache__/' "$REPO_ROOT/skills/" "$REPO_ROOT/.claude/skills/"
+    rsync -a --delete "$REPO_ROOT/agents/" "$REPO_ROOT/.claude/agents/"
+  else
+    cp -R "$REPO_ROOT/skills/." "$REPO_ROOT/.claude/skills/"
+    cp -R "$REPO_ROOT/agents/." "$REPO_ROOT/.claude/agents/"
+  fi
+}
+
+do_start() {
+  local fg=0
+  [[ "${1:-}" == "--foreground" ]] && fg=1
+  if is_running; then echo "Already running (PID $(get_pid))."; return 0; fi
+  [[ -f .env ]] || echo "warning: no slack_bot/.env - relying on exported env vars / ~/.config/slack/credentials.json" >&2
+  activate_venv
+  sync_claude_dir
+  mkdir -p "$OUT_DIR"
+  export ANTHROPIC_LOG="${ANTHROPIC_LOG:-warn}"
+  if [[ $fg -eq 1 ]]; then
+    exec python app.py
+  fi
+  nohup python app.py >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+  sleep 2
+  if is_running; then echo "Started (PID $(get_pid)); log: $LOG_FILE"; else echo "Failed to start; see $LOG_FILE" >&2; tail -20 "$LOG_FILE" >&2 || true; exit 1; fi
+}
+
+do_stop() {
+  local force=0; [[ "${1:-}" == "--force" ]] && force=1
+  if ! is_running; then echo "Not running."; rm -f "$PID_FILE"; return 0; fi
+  local p; p=$(get_pid)
+  kill -TERM "$p" 2>/dev/null || true
+  for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+  if kill -0 "$p" 2>/dev/null; then
+    if [[ $force -eq 1 ]]; then kill -KILL "$p"; echo "Killed (PID $p)."; else echo "Still running after 10 s; use --force." >&2; return 1; fi
+  else
+    echo "Stopped (PID $p)."
+  fi
+  rm -f "$PID_FILE"
+}
+
+do_status() {
+  if is_running; then echo "Running (PID $(get_pid)); log: $LOG_FILE"; else echo "Not running."; rm -f "$PID_FILE"; return 1; fi
+}
+
+case "${1:-}" in
+  setup)   do_setup ;;
+  start)   shift; do_start "${1:-}" ;;
+  stop)    shift; do_stop "${1:-}" ;;
+  restart) do_stop --force || true; do_start ;;
+  status)  do_status ;;
+  logs)    mkdir -p "$OUT_DIR"; touch "$LOG_FILE"; tail -f "$LOG_FILE" ;;
+  *)       usage ;;
+esac

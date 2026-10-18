@@ -14,3 +14,8 @@ __pycache__/
 credentials.json
 service_account.json
 apps_script.json
+# slack bot local state
+slack_bot/.venv/
+slack_bot/.state/
+slack_bot/out/
+slack_bot/.env
