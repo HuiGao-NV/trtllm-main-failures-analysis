@@ -125,7 +125,7 @@ def api_request(base_url: str, path: str, auth: str, method: str = "GET", body: 
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         sys.exit(f"Confluence API error {e.code} on {method} {path}: {e.read().decode()[:2000]}")

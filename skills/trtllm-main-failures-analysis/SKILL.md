@@ -57,6 +57,7 @@ Details" (Main Break) data at
 | 6 | `fetch_full_error.py` | full error/callstack (ci_report `_pbss_log` + Blue Ocean log + JUnit archive) |
 | 6 | `fetch_confluence_case_analysis.py`, `fetch_sheet_case_analysis.py` | recorded Failure Type + error signature per case (skip unchanged) |
 | 6 | `get_base_commit.py` | true `main` base of each build (GitHub merge-base) and whether it predates a fix |
+| 6/7 | `check_pr_test_history.py` | test-leak check: every pre-merge build of the culprit PR with the case's / roll-up's status, reuse skips, `/bot` comments → `pr<PR>_ci_history.{json,md}` |
 | — | `durations.py` | shared helper: `hours_between()`, `human()` → `x days x hours x minutes` (used by every script that reports a time gap) |
 | 7 | `rebase_actions.py` | PRs on pre-fix bases (`base_is_pre_fix` from `get_base_commit.py`) + their GitHub authors → `rebase_actions_<date>.json` and the report/Slack "Rebase Action:" section |
 | 7 | `problem_commits.py` | commit sha, PR, author, commit time (UTC) and PR merge time for every commit/PR involved in a problem (culprit / early / late / fix) → `problem_commits_<label>.{json,md}` + Slack snippet |
@@ -266,6 +267,77 @@ For every PR behind the group's recent failures, run `ci-regression-verifier`
    PostMerge builds test `main` directly and pin the range best.
 3. Verify the candidate with `ci-regression-verifier` (read the specific hunk,
    confirm the exact mechanism), output `<run_dir>/verify_<slug>_commit<sha>.json`.
+3.5. **Check whether the candidate PR's own last pre-merge build ever ran this
+   case, and record the result.** Don't assume a PR that "own-broke" a test is
+   automatically a `PR-own defect` — check what its last build actually
+   exercised. Fast path via `trtllm-opensearch-queries` (seconds, no auth,
+   faster than scanning ci_report under load):
+   ```json
+   POST http://gpuwa.nvidia.com/opensearch/df-swdl-trtllm-infra-ci-prod-stage_info-*/_search
+   {"size": 5, "query": {"bool": {"must": [
+     {"term": {"s_trigger_mr_id": "<candidate PR>"}},
+     {"term": {"s_job_name": "LLM/main/L0_MergeRequest_PR"}},
+     {"term": {"s_stage_type": "TopParallelBranch"}}
+   ]}}, "sort": [{"ts_created": {"order": "desc"}}],
+   "_source": ["s_build_id","s_stage_name","s_status","ts_created"]}
+   ```
+   Find the stage that hosts this case in the newest (last) build; if that
+   stage's `s_status` is `SKIP`, the case never ran there — query `test_info`
+   with `{"term": {"s_build_id": "<that build>"}}` plus a wildcard on the test
+   name to confirm absence. If it's `SUCCESS`/`FAILURE`, query `test_info` the
+   same way to see whether the case itself `PASSED`/`FAILED`/is absent from
+   that stage's roll-up. Repeat one build back if useful to see whether an
+   *earlier* build in the same PR ran and passed it (worth comparing against
+   `get_base_commit.py`'s base for that earlier build — a stale base there can
+   mean the pass reflects pre-conflict code, not proof the PR is clean).
+   **Never stop at the last build.** A green last build can be a reuse skip:
+   `/bot run` reruns mark a roll-up `SKIPPED` with `s_skipped_message:
+   "Reused from previous pipeline"` whenever an earlier build left a PASSED row
+   for it — and an isolated rerun of a failed roll-up leaves exactly such a row
+   next to the FAILED one. So walk **every** build of the PR and, per build,
+   read test_info for the case *and* its roll-up (`test_unittests_v2[<turtle>]`):
+   ```bash
+   check_pr_test_history.py --pr <candidate PR> --test '<entity_name>' \
+     [--stage-substring <stage>] --out <run_dir>/pr<PR>_ci_history.json \
+     --md-out <run_dir>/pr<PR>_ci_history.md
+   ```
+   It prints one row per build (created, head, relevant stage status, verdict:
+   `test FAILED` / `test PASSED` / `NOT RUN - roll-up reused` / `TEST FILE
+   ABSENT FROM BRANCH (stage ran: …)` / `stage not scheduled`, plus
+   `+ isolated-rerun PASSED row (reuse hazard)`), the PR's `/bot …` comments so
+   reruns and `/bot skip` can be matched to builds, and whether the merged head
+   was ever built. When the test left no row it asks GitHub whether the test
+   file exists on that head (`test_file_on_head`), so "the gate never ran it"
+   is never written for a test that could not have run. Put the `.json` in
+   `evidence_files`.
+   Record `candidate_pr_last_build_ran_case` in `analysis_<slug>.json`:
+   `{"build": ..., "stage_status": "SKIP|SUCCESS|FAILURE", "case_status":
+   "PASSED|FAILED|absent", "builds_where_case_failed": [...], "note": "..."}`.
+   This result changes the
+   classification, not just the evidence. Decide in this order:
+   - **`TEST FILE ABSENT FROM BRANCH`** (`test_file_absent_from_branch: true`)
+     → the test (or the check it performs) landed on `main` *after* the PR's
+     branch forked, so no build of the PR could ever have run it. That is a
+     **semantic conflict** by definition — early = the `main` commit that
+     added the test (`gh api "repos/NVIDIA/TensorRT-LLM/commits?path=tests/<file>&sha=main"`),
+     late = the candidate PR — *not* a test leak and *not* a PR-own defect,
+     even though the late PR "alone" would fail on today's `main`. "Alone"
+     means on a `main` without the other commit: the late PR's own gate was
+     green on such a base, and the early commit was green before the late one
+     merged (check the post-merge run on the early commit). Record it with the
+     `semantic-conflict-analyzer`; a check-type test (generated file current,
+     lint, golden manifest) usually conflicts with every in-flight PR touching
+     its inputs, so expect and list several late commits (2026-10-16: #19077,
+     #19713, #19986 against the schema check from #19906).
+   - Last build **skipped the stage** or the case is **absent from a stage
+     that ran while the file was on the branch** → the gate never verified it
+     — `test_leak` (Step 7); if an *earlier* build in the same PR passed it
+     against a base later found to predate another commit that also touches
+     the same code path, re-open this as a **semantic conflict** instead.
+   - Last build **ran and failed**, merged anyway → `test_leak` (gate let a
+     verified-red case through).
+   - Last build **ran and passed**, base was current (not stale) → genuine
+     `PR-own defect` stands.
 4. **Validate any attributed fix**: every failing build must have
    `base_is_pre_fix: true`; any `false` means that build's failure has another
    cause — split it off and re-investigate rather than closing it out. Also
@@ -446,7 +518,19 @@ consumer" — any two-sided logic incompatibility qualifies (fixtures, ordering,
 resource contention, config defaults, anything), as long as each side is
 independently clean. If a *single* commit's own pre-merge build already
 reproduces the failure (that PR alone is red), this is not a semantic conflict
-— see **test_leak** below instead.
+— see **test_leak** below instead. "Alone" is judged on the PR's own CI base,
+not on today's `main`: a PR whose branch predates the test is clean alone
+even if cherry-picking it onto current `main` would fail. Method C step 3.5's
+last-build check is the concrete way to catch this; two signatures count:
+(a) a case that fails only after merge, but *passed* in an earlier build of
+the same PR tested against a now-stale base — find the other commit that
+landed on `main` between that earlier build's base and the merge and touches
+the same code path; (b) `TEST FILE ABSENT FROM BRANCH` in every build of the
+PR — the test itself is the early side (the commit that added it), the PR is
+the late side. A newly landed *check* (schema/manifest currency, lint,
+golden file) conflicts this way with every in-flight PR that changes its
+inputs, so one early commit can have several late commits within hours;
+record each late commit (the analyzer's `additional_late_commits`).
 
 When a `regression-*` group is a genuine two-PR semantic conflict, delegate the
 measurement to the `semantic-conflict-analyzer` agent (entities, the two
@@ -462,10 +546,38 @@ final head, the test was treated as non-blocking/out of gate scope, or a
 failure was observed but merged anyway. The defect existed at merge time and
 was verifiable, but the gate let it leak onto `main` regardless — that gap in
 pre-merge verification is the reportable finding, distinct from an ordinary
-regression where the introducing PR's own CI was clean. Confirm with
-`get_base_commit.py`/`ci-jenkins-log-navigator` that the introducing PR's own
-build for this test either didn't run on the final head or ran and failed
-without blocking the merge, and say which in `reasoning`.
+regression where the introducing PR's own CI was clean.
+
+*Check process (required before writing `test_leak`):*
+1. `check_pr_test_history.py --pr <PR> --test '<entity_name>' --out
+   <run_dir>/pr<PR>_ci_history.json --md-out …` — every L0_MergeRequest_PR
+   build of the PR with the case's and its roll-up's test_info rows.
+2. Classify from the table, and say which in `reasoning`:
+   - case `FAILED` in one or more builds and the last build shows `NOT RUN -
+     roll-up reused` (or stage `SUCCESS` with the case absent) → **reuse-skip
+     leak**: the gate accepted a stale PASSED row (PR #19171 build 63492→63522,
+     PR #20024 builds 63500..63948→64000). Action `flag-ci-gating-gap` must
+     name the reused roll-up and the two builds.
+   - case `FAILED` in the last build and the PR merged anyway (`/bot skip`,
+     admin merge) → **merged-red leak**; quote the `/bot` comment.
+   - case never appears, `test_file_absent_from_branch: true` → **not a leak**:
+     the test did not exist on the branch; this is a semantic conflict with
+     the commit that added the test (Method C step 3.5). Stop here and record
+     it as such — on 2026-10-16 the schema-currency break was first written up
+     as an "unscheduled test leak" of PR #19077 although its CPU-Generic stages
+     had run; only the file was missing from the branch.
+   - case never appears although the file *was* on the head, and the hosting
+     stage was `SKIP`/not scheduled on the final head → **unscheduled leak**;
+     if an *earlier* build passed it on a stale base, re-check for a semantic
+     conflict (Method C step 3.5).
+   - case `PASSED` in the last build on a current base → not a leak; go back
+     to `PR-own defect` / `Regression`.
+3. Also record whether the merged head itself was ever built
+   (`merged_head_was_built`); a `/bot skip --comment "Passing CI before merge"`
+   on an unbuilt head is part of the finding, not the cause.
+4. Do not write "the gate never ran the check" unless step 1 shows no FAILED
+   row in any build — on 2026-10-15 that wording was wrong for PR #20024, where
+   the checker had failed six times before the reuse skip.
 
 ## Step 8: Report
 
@@ -700,3 +812,17 @@ Field rules:
 - Treating a stage retry that passes as proof of a fix: the retry runs alone in
   a fresh container (different autotuner-cache/test-order state) and on another
   node; compare it with same-day, same-base first attempts.
+- Calling a break "PR-own defect" from the diff alone without checking (Method
+  C step 3.5) whether the candidate PR's own last pre-merge build actually ran
+  the case: a case that looks self-inconsistent within one PR can really be a
+  semantic conflict — the PR's last build skipped the relevant stage, and an
+  earlier build that did pass it was tested against a base that predated the
+  other commit it actually conflicts with on `main`.
+- Calling a break a "test leak" because the culprit PR's CI "never ran the
+  test", without checking whether the test file existed on the PR's branch:
+  a test that landed on `main` after the branch forked cannot run in that
+  PR's CI, and "the stage was not scheduled" was simply false (the stages
+  ran, the file was absent). That shape is a semantic conflict between the
+  test-adding commit and the PR — label it so and measure it; the
+  `check_pr_test_history.py` verdict `TEST FILE ABSENT FROM BRANCH` exists
+  for exactly this (2026-10-16, schema check #19906 × #19077/#19713/#19986).

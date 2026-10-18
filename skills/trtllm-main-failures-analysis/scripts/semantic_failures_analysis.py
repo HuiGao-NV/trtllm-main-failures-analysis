@@ -24,6 +24,17 @@ and computes
                                 stage was skipped/reused or the test not listed)
 plus, per commit: sha, PR, PR title, merge time, PR created time, time-to-merge.
 
+Optionally records the callstack depth of the conflict itself: how many stack
+frames separate the test entry point from the frame where the incompatibility
+actually manifests (the deepest frame naming both sides, e.g. the call whose
+argument/attribute one side removed and the other still supplies). Pass it
+with --callstack-depth (count frames in the full traceback from
+RUN_DIR/full_error_<slug>.json) and, optionally, --callstack-summary (a short
+arrow-chain, e.g. "test_msa_buffers_stage_local_cache_views -> msa_idx_k_cache
+-> get_index_k_buffer"). A shallow depth (1-2) means the conflict is visible
+right at the test/call boundary; a deep one means it only surfaces several
+calls into shared code, which is harder to catch by code review alone.
+
 Commit -> PR and PR metadata come from GitHub (`gh api`); builds of PR B come
 from ci_report (`job_info.s_trigger_mr_id`, `ts_created`, `s_trigger_mr_commit`)
 by scanning a build-id range; base_commit uses the same merge-base rule as
@@ -134,6 +145,11 @@ def main() -> int:
     ap.add_argument("--last-build", default=None, help="known last pre-merge L0_MergeRequest_PR build of the late PR (skips the ci_report scan)")
     ap.add_argument("--label", default=None, help="problem id / label, e.g. P16")
     ap.add_argument("--platform", default=None)
+    ap.add_argument("--callstack-depth", type=int, default=None,
+                     help="number of stack frames from the test entry point to the frame where "
+                          "the conflict actually manifests (count from the full traceback)")
+    ap.add_argument("--callstack-summary", default=None,
+                     help="short arrow-chain of the frames, e.g. 'test_x -> helper -> real_call'")
     ap.add_argument("--out", required=True, help="JSON output for this analysis")
     ap.add_argument("--stats-file", default=None, help="JSONL file to append one record per entity (dedup on entity+late)")
     a = ap.parse_args()
@@ -180,7 +196,8 @@ def main() -> int:
     for ent in a.entity:
         records.append(dict(label=a.label, entity_name=ent, platform=a.platform, analyzed_at=dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
                             early_commit=early, late_commit=late, fix_commit=fix,
-                            last_build_of_late_pr=lb, base_commit=base, relations=rel))
+                            last_build_of_late_pr=lb, base_commit=base, relations=rel,
+                            callstack_depth=a.callstack_depth, callstack_summary=a.callstack_summary))
     json.dump(dict(records=records), open(a.out, "w"), indent=1)
 
     if a.stats_file:
@@ -206,6 +223,8 @@ def main() -> int:
         print(f"base_commit  : {fmt(base)}")
     for k, v in rel.items():
         print(f"{k:14}: {v.get('duration')} ({v.get('hours')} h), {v.get('commits')} commits" + ("  (early already in base)" if v.get("early_already_in_base") else ""))
+    if a.callstack_depth is not None:
+        print(f"callstack_depth: {a.callstack_depth}" + (f"  ({a.callstack_summary})" if a.callstack_summary else ""))
     print(f"entities     : {len(records)} -> {a.out}" + (f" (+ {a.stats_file})" if a.stats_file else ""))
     return 0
 
